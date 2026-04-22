@@ -1,0 +1,27 @@
+# Derby metastore data
+metastore_db/
+
+# Hive and Hadoop runtime logs
+*.log
+logs/
+/tmp/
+
+# Docker override files
+docker-compose.override.yml
+
+# Environment secrets (keep hadoop.env as it has no secrets, but ignore any local overrides)
+*.env.local
+.env
+
+# Boot log captures
+bootlogs.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
