@@ -1,0 +1,4 @@
+<configuration>
+<property><name>mapreduce.application.classpath</name><value>/opt/hadoop/share/hadoop/mapreduce/*:/opt/hadoop/share/hadoop/mapreduce/lib/*</value></property>
+<property><name>mapreduce.framework.name</name><value>yarn</value></property>
+</configuration>

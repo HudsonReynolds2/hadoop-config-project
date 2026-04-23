@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<configuration>
+
+  <!-- Metastore backing database: Postgres -->
+  <property>
+    <n>javax.jdo.option.ConnectionURL</n>
+    <value>jdbc:postgresql://postgres-metastore:5432/metastore</value>
+  </property>
+  <property>
+    <n>javax.jdo.option.ConnectionDriverName</n>
+    <value>org.postgresql.Driver</value>
+  </property>
+  <property>
+    <n>javax.jdo.option.ConnectionUserName</n>
+    <value>hive</value>
+  </property>
+  <property>
+    <n>javax.jdo.option.ConnectionPassword</n>
+    <value>hive</value>
+  </property>
+
+  <!-- Warehouse lives on HDFS -->
+  <property>
+    <n>hive.metastore.warehouse.dir</n>
+    <value>hdfs://namenode:8020/user/hive/warehouse</value>
+  </property>
+
+  <!-- Metastore service -->
+  <property>
+    <n>hive.metastore.uris</n>
+    <value>thrift://hive-metastore:9083</value>
+  </property>
+
+  <!-- Don't try to auto-create schema at runtime; we use schematool in the init service -->
+  <property>
+    <n>datanucleus.schema.autoCreateAll</n>
+    <value>false</value>
+  </property>
+  <property>
+    <n>hive.metastore.schema.verification</n>
+    <value>true</value>
+  </property>
+
+  <!-- HS2 binding -->
+  <property>
+    <n>hive.server2.thrift.port</n>
+    <value>10000</value>
+  </property>
+  <property>
+    <n>hive.server2.thrift.bind.host</n>
+    <value>0.0.0.0</value>
+  </property>
+  <property>
+    <n>hive.server2.webui.host</n>
+    <value>0.0.0.0</value>
+  </property>
+  <property>
+    <n>hive.server2.webui.port</n>
+    <value>10002</value>
+  </property>
+
+  <!-- Auth: NONE for dev cluster -->
+  <property>
+    <n>hive.server2.authentication</n>
+    <value>NONE</value>
+  </property>
+  <property>
+    <n>hive.server2.enable.doAs</n>
+    <value>false</value>
+  </property>
+
+  <!-- Tell Hive the default fs explicitly (some Hive internals check here before core-site) -->
+  <property>
+    <n>fs.defaultFS</n>
+    <value>hdfs://namenode:8020</value>
+  </property>
+</configuration>

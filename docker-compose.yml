@@ -1,148 +1,494 @@
-version: "3.8"
-
 networks:
   hadoop-net:
     driver: bridge
 
+volumes:
+  namenode-data:
+  datanode-data:
+  postgres-data:
+  kafka-data:
+  zk-data:
+  zk-datalog:
+
+# Reusable config-mount block: all Hadoop-family services get the same XMLs.
+x-hadoop-conf: &hadoop-conf
+  - ./conf/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:rw
+  - ./conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:rw
+  - ./conf/yarn-site.xml:/opt/hadoop/etc/hadoop/yarn-site.xml:rw
+  - ./conf/mapred-site.xml:/opt/hadoop/etc/hadoop/mapred-site.xml:rw
+
 services:
 
+  # -----------------------------------------------------------------------
+  # ZooKeeper (real one, not Kafka KRaft controller)
+  # -----------------------------------------------------------------------
   zookeeper:
-    image: apache/kafka:latest
+    image: zookeeper:3.9.2
     container_name: zookeeper
+    hostname: zookeeper
+    ports:
+      - "2181:2181"
     environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: controller
-      KAFKA_LISTENERS: CONTROLLER://:9093
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@zookeeper:9093
-      CLUSTER_ID: "hadoop-config-test-cluster"
+      ZOO_MY_ID: "1"
+      ZOO_SERVERS: "server.1=zookeeper:2888:3888;2181"
+      # 4lw allow-list required for the healthcheck below
+      ZOO_4LW_COMMANDS_WHITELIST: "ruok,stat,conf,mntr"
+    volumes:
+      - zk-data:/data
+      - zk-datalog:/datalog
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     networks:
       - hadoop-net
 
+  # -----------------------------------------------------------------------
+  # Kafka (KRaft combined mode: controller + broker in one process).
+  # Simpler than a separate controller container, sufficient for a test cluster.
+  # -----------------------------------------------------------------------
   kafka:
-    image: apache/kafka:latest
+    image: apache/kafka:3.8.0
     container_name: kafka
-    depends_on:
-      - zookeeper
+    hostname: kafka
     ports:
       - "9092:9092"
     environment:
-      KAFKA_NODE_ID: 2
-      KAFKA_PROCESS_ROLES: broker
-      KAFKA_LISTENERS: PLAINTEXT://:9092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@zookeeper:9093
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "controller,broker"
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
       CLUSTER_ID: "hadoop-config-test-cluster"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
     networks:
       - hadoop-net
 
+  # -----------------------------------------------------------------------
+  # Postgres — Hive metastore backing DB
+  # -----------------------------------------------------------------------
+  postgres-metastore:
+    image: postgres:16
+    container_name: postgres-metastore
+    hostname: postgres-metastore
+    environment:
+      POSTGRES_PASSWORD: "postgres"
+      POSTGRES_DB: "postgres"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - hadoop-net
+
+  # -----------------------------------------------------------------------
+  # HDFS NameNode
+  # -----------------------------------------------------------------------
   namenode:
-    image: apache/hadoop:3
+    image: apache/hadoop:3.3.6
     container_name: namenode
     hostname: namenode
-    command: ["hdfs", "namenode"]
+    user: root
+    # The apache/hadoop:3.3.6 entrypoint only formats when $ENSURE_NAMENODE_DIR
+    # does not exist as a directory. Docker creates the volume mount target
+    # before the container runs, so that check never fires. We do our own
+    # check against the VERSION file, which is the true "is it formatted" marker.
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        if [ ! -f /hadoop/dfs/name/current/VERSION ]; then
+          echo "[namenode] no VERSION file found, formatting HDFS"
+          hdfs namenode -format -force -nonInteractive
+        else
+          echo "[namenode] already formatted, skipping format"
+        fi
+        exec hdfs namenode
     ports:
-      - "9870:9870"
-      - "8020:8020"
+      - "9870:9870"   # WebHDFS UI
+      - "8020:8020"   # RPC
     environment:
-      ENSURE_NAMENODE_DIR: "/tmp/hadoop-root/dfs/name"
+      ENSURE_NAMENODE_DIR: "/hadoop/dfs/name"
     env_file:
       - ./hadoop.env
+    volumes:
+      - namenode-data:/hadoop/dfs/name
+      - ./conf/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:rw
+      - ./conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:rw
+      - ./conf/yarn-site.xml:/opt/hadoop/etc/hadoop/yarn-site.xml:rw
+      - ./conf/mapred-site.xml:/opt/hadoop/etc/hadoop/mapred-site.xml:rw
+    healthcheck:
+      # Safe-mode OFF means the NN has loaded fsimage and is accepting writes
+      test: ["CMD-SHELL", "hdfs dfsadmin -safemode get 2>/dev/null | grep -q 'Safe mode is OFF'"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
     networks:
       - hadoop-net
 
+  # -----------------------------------------------------------------------
+  # HDFS DataNode
+  # -----------------------------------------------------------------------
   datanode:
-    image: apache/hadoop:3
+    image: apache/hadoop:3.3.6
     container_name: datanode
     hostname: datanode
+    user: root
     command: ["hdfs", "datanode"]
     depends_on:
-      - namenode
+      namenode:
+        condition: service_healthy
     ports:
       - "9864:9864"
     env_file:
       - ./hadoop.env
+    volumes:
+      - datanode-data:/hadoop/dfs/data
+      - ./conf/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:rw
+      - ./conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:rw
+      - ./conf/yarn-site.xml:/opt/hadoop/etc/hadoop/yarn-site.xml:rw
+      - ./conf/mapred-site.xml:/opt/hadoop/etc/hadoop/mapred-site.xml:rw
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9864 >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
     networks:
       - hadoop-net
 
+  # -----------------------------------------------------------------------
+  # YARN ResourceManager
+  # -----------------------------------------------------------------------
   resourcemanager:
-    image: apache/hadoop:3
+    image: apache/hadoop:3.3.6
     container_name: resourcemanager
     hostname: resourcemanager
+    user: root
     command: ["yarn", "resourcemanager"]
     depends_on:
-      - namenode
+      namenode:
+        condition: service_healthy
     ports:
       - "8088:8088"
+      - "8032:8032"
     env_file:
       - ./hadoop.env
+    volumes:
+      - ./conf/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:rw
+      - ./conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:rw
+      - ./conf/yarn-site.xml:/opt/hadoop/etc/hadoop/yarn-site.xml:rw
+      - ./conf/mapred-site.xml:/opt/hadoop/etc/hadoop/mapred-site.xml:rw
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8088/ws/v1/cluster/info | grep -q '\"state\":\"STARTED\"'"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
     networks:
       - hadoop-net
 
+  # -----------------------------------------------------------------------
+  # YARN NodeManager
+  # -----------------------------------------------------------------------
   nodemanager:
-    image: apache/hadoop:3
+    image: apache/hadoop:3.3.6
     container_name: nodemanager
     hostname: nodemanager
+    user: root
     command: ["yarn", "nodemanager"]
     depends_on:
-      - resourcemanager
+      resourcemanager:
+        condition: service_healthy
+      datanode:
+        condition: service_healthy
     ports:
       - "8042:8042"
     env_file:
       - ./hadoop.env
+    volumes:
+      - ./conf/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:rw
+      - ./conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:rw
+      - ./conf/yarn-site.xml:/opt/hadoop/etc/hadoop/yarn-site.xml:rw
+      - ./conf/mapred-site.xml:/opt/hadoop/etc/hadoop/mapred-site.xml:rw
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8042/ws/v1/node/info >/dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
     networks:
       - hadoop-net
 
+  # -----------------------------------------------------------------------
+  # HDFS initializer: one-shot. Creates warehouse dirs, uploads the Spark
+  # archive so spark-submit --master yarn doesn't re-upload on every job.
+  # -----------------------------------------------------------------------
+  hdfs-init:
+    image: apache/hadoop:3.3.6
+    container_name: hdfs-init
+    user: root
+    depends_on:
+      namenode:
+        condition: service_healthy
+      datanode:
+        condition: service_healthy
+    volumes:
+      - ./conf/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:rw
+      - ./conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:rw
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        echo "[hdfs-init] creating warehouse and user dirs"
+        hdfs dfs -mkdir -p /user/hive/warehouse
+        hdfs dfs -mkdir -p /user/spark
+        hdfs dfs -mkdir -p /user/root
+        hdfs dfs -mkdir -p /tmp
+        hdfs dfs -chmod -R 1777 /tmp
+        hdfs dfs -chmod -R 777 /user/hive/warehouse
+        hdfs dfs -chmod -R 777 /user/spark
+        echo "[hdfs-init] done"
+    restart: "no"
+    networks:
+      - hadoop-net
+
+  # -----------------------------------------------------------------------
+  # Spark archive initializer: package Spark jars and upload to HDFS so
+  # spark-submit --master yarn picks them up via spark.yarn.archive instead
+  # of re-uploading on every job.
+  # -----------------------------------------------------------------------
+  spark-archive-init:
+    image: apache/spark:3.5.3
+    container_name: spark-archive-init
+    user: root
+    depends_on:
+      hdfs-init:
+        condition: service_completed_successfully
+    environment:
+      HADOOP_CONF_DIR: "/opt/hadoop-conf"
+    volumes:
+      - ./conf/core-site.xml:/opt/hadoop-conf/core-site.xml:ro
+      - ./conf/hdfs-site.xml:/opt/hadoop-conf/hdfs-site.xml:ro
+      - ./conf/yarn-site.xml:/opt/hadoop-conf/yarn-site.xml:ro
+      - ./conf/mapred-site.xml:/opt/hadoop-conf/mapred-site.xml:ro
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        ARCHIVE=/tmp/spark-jars.zip
+        if /opt/spark/bin/hadoop fs -test -e /user/spark/spark-jars.zip 2>/dev/null; then
+          echo "[spark-archive-init] archive already on HDFS, skipping"
+          exit 0
+        fi
+        echo "[spark-archive-init] zipping /opt/spark/jars"
+        cd /opt/spark/jars && zip -q $$ARCHIVE *.jar
+        echo "[spark-archive-init] uploading to hdfs:///user/spark/spark-jars.zip"
+        /opt/spark/bin/hadoop fs -mkdir -p /user/spark
+        /opt/spark/bin/hadoop fs -put -f $$ARCHIVE /user/spark/spark-jars.zip
+        echo "[spark-archive-init] done"
+    restart: "no"
+    networks:
+      - hadoop-net
+
+  # -----------------------------------------------------------------------
+  # Hive metastore schema initializer: runs schematool once against Postgres.
+  # Separate one-shot so HMS itself starts clean.
+  #
+  # IMPORTANT: the apache/hive:4.0.0 entrypoint overwrites hive-site.xml on
+  # every start via `envsubst`, so HIVE_CUSTOM_CONF_DIR doesn't actually let
+  # us set JDBC creds that way. The supported API is SERVICE_OPTS, which
+  # passes -D system properties to the JVM.
+  # -----------------------------------------------------------------------
+  hive-schema-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.hive
+    image: hadoop-stack-hive:local
+    container_name: hive-schema-init
+    user: hive
+    depends_on:
+      postgres-metastore:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: "schematool"
+      DB_DRIVER: "postgres"
+      SCHEMA_COMMAND: "initSchema"
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres-metastore:5432/metastore
+        -Djavax.jdo.option.ConnectionUserName=hive
+        -Djavax.jdo.option.ConnectionPassword=hive
+    restart: "no"
+    networks:
+      - hadoop-net
+
+  # -----------------------------------------------------------------------
+  # Hive Metastore (HMS) — Thrift service on 9083
+  # -----------------------------------------------------------------------
   hive-metastore:
-    image: apache/hive:4.0.0
+    image: hadoop-stack-hive:local
     container_name: hive-metastore
     hostname: hive-metastore
     depends_on:
-      - namenode
-      - datanode
-    command: ["hiveserver2"]
+      hive-schema-init:
+        condition: service_completed_successfully
+      namenode:
+        condition: service_healthy
+      datanode:
+        condition: service_healthy
+    ports:
+      - "9083:9083"
+    environment:
+      SERVICE_NAME: "metastore"
+      DB_DRIVER: "postgres"
+      # IS_RESUME=true so metastore service doesn't re-run schematool
+      IS_RESUME: "true"
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres-metastore:5432/metastore
+        -Djavax.jdo.option.ConnectionUserName=hive
+        -Djavax.jdo.option.ConnectionPassword=hive
+        -Dhive.metastore.warehouse.dir=hdfs://namenode:8020/user/hive/warehouse
+        -Dfs.defaultFS=hdfs://namenode:8020
+    healthcheck:
+      test: ["CMD-SHELL", "ss -tln | grep -q ':9083' || netstat -tln 2>/dev/null | grep -q ':9083'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks:
+      - hadoop-net
+
+  # -----------------------------------------------------------------------
+  # HiveServer2 — JDBC/Thrift on 10000, web UI on 10002
+  # Points at the remote metastore service via hive.metastore.uris.
+  # -----------------------------------------------------------------------
+  hive-server2:
+    image: hadoop-stack-hive:local
+    container_name: hive-server2
+    hostname: hive-server2
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
     ports:
       - "10000:10000"
       - "10002:10002"
     environment:
-      SERVICE_NAME: hiveserver2
-      DB_DRIVER: derby
-      fs.defaultFS: hdfs://namenode:8020
-      hive.metastore.warehouse.dir: hdfs://namenode:8020/user/hive/warehouse
-      hive.server2.thrift.port: "10000"
-      hive.server2.thrift.bind.host: "0.0.0.0"
-    env_file:
-      - ./hadoop.env
+      SERVICE_NAME: "hiveserver2"
+      IS_RESUME: "true"
+      SERVICE_OPTS: >-
+        -Dhive.metastore.uris=thrift://hive-metastore:9083
+        -Dhive.server2.thrift.port=10000
+        -Dhive.server2.thrift.bind.host=0.0.0.0
+        -Dhive.server2.authentication=NONE
+        -Dhive.server2.enable.doAs=false
+        -Dfs.defaultFS=hdfs://namenode:8020
+    healthcheck:
+      test: ["CMD-SHELL", "ss -tln | grep -q ':10000' || netstat -tln 2>/dev/null | grep -q ':10000'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
     networks:
       - hadoop-net
 
+  # -----------------------------------------------------------------------
+  # Spark Standalone Master
+  # -----------------------------------------------------------------------
   spark-master:
-    image: apache/spark:latest
+    image: apache/spark:3.5.3
     container_name: spark-master
     hostname: spark-master
+    user: root
     command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
     ports:
       - "8080:8080"
       - "7077:7077"
     environment:
-      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_HOST: "spark-master"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8080 >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
     networks:
       - hadoop-net
 
+  # -----------------------------------------------------------------------
+  # Spark Standalone Worker
+  # -----------------------------------------------------------------------
   spark-worker:
-    image: apache/spark:latest
+    image: apache/spark:3.5.3
     container_name: spark-worker
     hostname: spark-worker
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    user: root
     depends_on:
-      - spark-master
+      spark-master:
+        condition: service_healthy
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
     ports:
       - "8081:8081"
     environment:
       SPARK_WORKER_CORES: "2"
       SPARK_WORKER_MEMORY: "2g"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8081 >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
     networks:
       - hadoop-net
 
+  # -----------------------------------------------------------------------
+  # Spark "client" — idle container with Hadoop configs mounted, used for
+  # spark-submit --master yarn. No ports. Kept alive with `tail -f /dev/null`.
+  # -----------------------------------------------------------------------
+  spark-client:
+    image: apache/spark:3.5.3
+    container_name: spark-client
+    hostname: spark-client
+    user: root
+    depends_on:
+      resourcemanager:
+        condition: service_healthy
+      nodemanager:
+        condition: service_healthy
+      spark-archive-init:
+        condition: service_completed_successfully
+    environment:
+      HADOOP_CONF_DIR: "/opt/hadoop-conf"
+      YARN_CONF_DIR: "/opt/hadoop-conf"
+      SPARK_LOCAL_HOSTNAME: "spark-client"
+    volumes:
+      - ./conf/core-site.xml:/opt/hadoop-conf/core-site.xml:ro
+      - ./conf/hdfs-site.xml:/opt/hadoop-conf/hdfs-site.xml:ro
+      - ./conf/yarn-site.xml:/opt/hadoop-conf/yarn-site.xml:ro
+      - ./conf/mapred-site.xml:/opt/hadoop-conf/mapred-site.xml:ro
+      - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    command: ["tail", "-f", "/dev/null"]
+    networks:
+      - hadoop-net

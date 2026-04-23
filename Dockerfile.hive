@@ -1,0 +1,22 @@
+FROM apache/hive:4.0.0
+
+# Drop in the Postgres JDBC driver so the metastore can talk to Postgres.
+# apache/hive:4.0.0 bundles Derby by default; without this jar, switching
+# DB_DRIVER=postgres gives you a ClassNotFoundException on org.postgresql.Driver.
+#
+# The base image ships without curl/wget, so we install curl first, fetch the
+# jar from Maven Central, then leave curl installed (harmless, saves a layer).
+
+USER root
+
+ARG POSTGRES_JDBC_VERSION=42.7.3
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends curl ca-certificates \
+  && rm -rf /var/lib/apt/lists/* \
+  && curl -fsSL \
+       "https://repo1.maven.org/maven2/org/postgresql/postgresql/${POSTGRES_JDBC_VERSION}/postgresql-${POSTGRES_JDBC_VERSION}.jar" \
+       -o /opt/hive/lib/postgresql-${POSTGRES_JDBC_VERSION}.jar \
+  && chmod 644 /opt/hive/lib/postgresql-${POSTGRES_JDBC_VERSION}.jar
+
+USER hive

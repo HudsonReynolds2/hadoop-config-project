@@ -1,0 +1,3 @@
+<configuration>
+<property><name>fs.defaultFS</name><value>hdfs://namenode:8020</value></property>
+</configuration>
