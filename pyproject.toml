@@ -7,11 +7,11 @@ name = "hadoop-config-checker"
 version = "0.1.0"
 description = "Configuration observability and consistency checking for Hadoop clusters."
 requires-python = ">=3.10"
-# Phase 1 is deliberately dependency-free — only stdlib is used.
+# Core package is dependency-free (stdlib only). Runtime extras add Kafka,
+# file watching, and CLI support.
 dependencies = []
 
 [project.optional-dependencies]
-# Phase 2+ will need these; listed here so the extras group already exists.
 runtime = [
     "kafka-python",
     "watchdog",
@@ -21,6 +21,9 @@ runtime = [
 test = [
     "pytest>=7",
 ]
+
+[project.scripts]
+hadoopconf = "checker.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["checker*"]

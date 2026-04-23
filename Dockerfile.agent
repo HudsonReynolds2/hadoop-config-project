@@ -1,0 +1,36 @@
+# Agent sidecar for hadoop-config-checker.
+#
+# Runs on every node that needs config monitoring.  Reads local config files
+# (bind-mounted into the container), publishes ConfigSnapshot JSON to Kafka.
+#
+# Build:
+#   docker build -f Dockerfile.agent -t hadoop-config-agent:local .
+#
+# The image carries no Hadoop binaries — it's a pure Python observer.
+
+FROM python:3.12-slim
+
+LABEL maintainer="hadoop-config-checker"
+LABEL description="Config observability agent — reads files, publishes to Kafka"
+
+# Runtime dependencies only.  The checker package itself is pure stdlib for
+# collection; kafka-python and watchdog are the two runtime extras.
+RUN pip install --no-cache-dir \
+    kafka-python \
+    watchdog \
+    click \
+    pyyaml
+
+COPY checker/ /app/checker/
+
+WORKDIR /app
+
+# Default env vars — override via docker-compose or `docker run -e`.
+ENV HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop \
+    CHECKER_KAFKA_BOOTSTRAP=kafka:9092 \
+    CHECKER_TOPIC=hadoop-config-snapshots \
+    CHECKER_SERVICE_NAME=unknown \
+    CHECKER_HEARTBEAT=60 \
+    CHECKER_LOG_LEVEL=INFO
+
+ENTRYPOINT ["python", "-m", "checker.agent"]
