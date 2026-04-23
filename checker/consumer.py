@@ -20,8 +20,9 @@ The pipeline on each incoming snapshot:
 3. Update the store.
 4. Run cross-source drift detection across all snapshots for this service
    (e.g. XML vs env file for the same service disagree).
-5. Emit all ``DriftResult`` objects as JSON to stdout.
-6. Optionally publish to the ``hadoop-config-alerts`` topic.
+5. Run the validator rule engine against the full store.
+6. Emit all ``DriftResult`` objects as JSON to stdout.
+7. Optionally publish to the ``hadoop-config-alerts`` topic.
 
 Environment variables
 ---------------------
@@ -40,6 +41,10 @@ CHECKER_CONSUMER_GROUP
 CHECKER_EMIT_ALERTS
     Set to ``"true"`` to publish drift results to the alerts topic.
     Default: ``"false"``
+
+CHECKER_RULES_FILE
+    Path to a YAML rule file.  When set, the validator runs on every
+    incoming snapshot.  Default: unset (validator disabled).
 
 CHECKER_LOG_LEVEL
     Python log level.  Default: ``INFO``
@@ -140,12 +145,14 @@ class SnapshotStore:
 def process_snapshot(
     snapshot: ConfigSnapshot,
     store: SnapshotStore,
+    rules: list[dict] | None = None,
 ) -> list[DriftResult]:
     """Run the full drift pipeline for one incoming snapshot.
 
     1. Temporal diff against the previous snapshot for this agent.
     2. Update the store.
     3. Cross-source diff across all snapshots for this service.
+    4. If rules are provided, run the validator.
 
     Returns all drift results (may be empty if nothing changed).
     """
@@ -172,6 +179,15 @@ def process_snapshot(
     if len(service_snaps) > 1:
         cross = detect_cross_source(service_snaps)
         results.extend(cross)
+
+    # 4. Validator rules — evaluate against the full store.
+    if rules:
+        from checker.analysis.validator import validate
+
+        vresults = validate(rules, store)
+        for vr in vresults:
+            if not vr.passed and vr.drift is not None:
+                results.append(vr.drift)
 
     return results
 
@@ -237,6 +253,7 @@ def run_consumer() -> None:
     group_id = _env("CHECKER_CONSUMER_GROUP", "hadoop-config-checker")
     emit_alerts = _env("CHECKER_EMIT_ALERTS", "false").lower() == "true"
     log_level = _env("CHECKER_LOG_LEVEL", "INFO")
+    rules_file = os.environ.get("CHECKER_RULES_FILE")
 
     logging.basicConfig(
         level=getattr(logging, log_level.upper(), logging.INFO),
@@ -248,6 +265,17 @@ def run_consumer() -> None:
         "consumer starting: kafka=%s topic=%s group=%s alerts=%s",
         bootstrap, topic, group_id, emit_alerts,
     )
+
+    # Load rules if configured
+    rules = None
+    if rules_file:
+        from checker.analysis.validator import load_rules
+
+        try:
+            rules = load_rules(rules_file)
+            logger.info("loaded %d rules from %s", len(rules), rules_file)
+        except Exception as exc:
+            logger.error("failed to load rules from %s: %s", rules_file, exc)
 
     _ensure_kafka()
 
@@ -303,7 +331,7 @@ def run_consumer() -> None:
                 snap.agent_id, snap.service, snap.source, len(snap.properties),
             )
 
-            results = process_snapshot(snap, store)
+            results = process_snapshot(snap, store, rules=rules)
 
             if results:
                 report = format_summary(results, snap.agent_id)
@@ -342,7 +370,10 @@ def run_consumer() -> None:
 # ---------------------------------------------------------------------------
 
 
-def run_oneshot(snapshot_file: str) -> list[DriftResult]:
+def run_oneshot(
+    snapshot_file: str,
+    rules: list[dict] | None = None,
+) -> list[DriftResult]:
     """Load snapshots from a JSON file and run full drift detection.
 
     The file should contain a JSON object mapping ``agent_id`` to snapshot
@@ -371,7 +402,7 @@ def run_oneshot(snapshot_file: str) -> list[DriftResult]:
     store = SnapshotStore()
     all_results: list[DriftResult] = []
     for snap in snapshots:
-        results = process_snapshot(snap, store)
+        results = process_snapshot(snap, store, rules=rules)
         all_results.extend(results)
 
     return all_results

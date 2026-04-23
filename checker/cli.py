@@ -1,13 +1,15 @@
 """CLI entry point for hadoop-config-checker.
 
 Provides the ``hadoopconf`` command with subcommands for consuming the
-snapshot stream and running one-shot drift detection.
+snapshot stream, running one-shot drift detection, validating rules, and
+collecting snapshots from local files.
 
 Usage::
 
-    hadoopconf consume          # start the Kafka consumer loop
-    hadoopconf oneshot FILE     # run drift detection on a snapshot JSON file
-    hadoopconf collect DIR      # collect and print snapshots from local files
+    hadoopconf consume                    # start the Kafka consumer loop
+    hadoopconf oneshot FILE               # drift detection on a snapshot JSON
+    hadoopconf validate CONF_DIR RULES    # validate local configs against rules
+    hadoopconf collect DIR                # collect and print snapshots
 
 All Kafka-related configuration is via environment variables (see
 ``checker.consumer`` and ``checker.agent`` docstrings).
@@ -53,6 +55,7 @@ def main():
         CHECKER_TOPIC             (default: hadoop-config-snapshots)
         CHECKER_CONSUMER_GROUP    (default: hadoop-config-checker)
         CHECKER_EMIT_ALERTS       (default: false)
+        CHECKER_RULES_FILE        (optional path to YAML rule file)
         CHECKER_LOG_LEVEL         (default: INFO)
         """
         from checker.consumer import run_consumer
@@ -61,6 +64,9 @@ def main():
 
     @cli.command()
     @click.argument("snapshot_file", type=click.Path(exists=True))
+    @click.option("--rules", "rules_file", default=None,
+                  type=click.Path(exists=True),
+                  help="YAML rule file to validate against.")
     @click.option(
         "--format",
         "fmt",
@@ -68,16 +74,20 @@ def main():
         default="text",
         help="Output format for drift results.",
     )
-    def oneshot(snapshot_file: str, fmt: str):
+    def oneshot(snapshot_file: str, rules_file: str | None, fmt: str):
         """Run one-shot drift detection on a snapshot JSON file.
 
-        The file should be a JSON object mapping agent_id to snapshot dicts,
-        or a JSON array of snapshot dicts.  Exits with code 1 if any drift
-        is found, 0 otherwise (useful as a CI/CD gate).
+        Exits with code 1 if any drift is found, 0 otherwise (useful as
+        a CI/CD gate).
         """
         from checker.consumer import run_oneshot
 
-        results = run_oneshot(snapshot_file)
+        rules = None
+        if rules_file:
+            from checker.analysis.validator import load_rules
+            rules = load_rules(rules_file)
+
+        results = run_oneshot(snapshot_file, rules=rules)
         if not results:
             if fmt == "text":
                 click.echo("No drift detected.")
@@ -98,6 +108,80 @@ def main():
                 click.echo()
 
         sys.exit(1)
+
+    @cli.command()
+    @click.argument("conf_dir", type=click.Path(exists=True))
+    @click.argument("rules_file", type=click.Path(exists=True))
+    @click.option("--service", default="unknown", help="Service name tag.")
+    @click.option("--env-file", default=None, help="Path to hadoop.env file.")
+    @click.option("--jvm-flags", default=None, help="JVM flags string.")
+    @click.option("--jvm-flags-name", default="jvm_flags", help="JVM flags source name.")
+    @click.option(
+        "--format",
+        "fmt",
+        type=click.Choice(["json", "text"]),
+        default="text",
+        help="Output format.",
+    )
+    def validate(
+        conf_dir: str,
+        rules_file: str,
+        service: str,
+        env_file: str | None,
+        jvm_flags: str | None,
+        jvm_flags_name: str,
+        fmt: str,
+    ):
+        """Validate local config files against a YAML rule set.
+
+        Collects snapshots from CONF_DIR, loads rules from RULES_FILE,
+        and reports all rule violations.  Exits with code 1 if any rule
+        fails, 0 if all pass.
+
+        \b
+        Example:
+          hadoopconf validate conf/ rules/hadoop-3.3.x.yaml --service namenode
+          hadoopconf validate conf/ rules/hadoop-3.3.x.yaml --env-file hadoop.env
+        """
+        from checker.agent import collect_all
+        from checker.analysis.validator import load_rules, validate as run_validate
+        from checker.consumer import SnapshotStore
+
+        snapshots = collect_all(
+            conf_dir, service, env_file, jvm_flags, jvm_flags_name
+        )
+        rules = load_rules(rules_file)
+
+        store = SnapshotStore()
+        for snap in snapshots:
+            store.put(snap)
+
+        results = run_validate(rules, store)
+
+        if fmt == "json":
+            click.echo(json.dumps([r.to_dict() for r in results], indent=2))
+        else:
+            passed = [r for r in results if r.passed]
+            failed = [r for r in results if not r.passed]
+
+            if passed:
+                click.echo(f"Passed ({len(passed)}):")
+                for r in passed:
+                    click.echo(f"  [PASS] {r.rule_id}: {r.details}")
+                click.echo()
+
+            if failed:
+                click.echo(f"Failed ({len(failed)}):")
+                for r in failed:
+                    click.echo(f"  [{r.severity.upper()}] {r.rule_id}: {r.details}")
+                click.echo()
+
+            if not failed:
+                click.echo("All rules passed.")
+            else:
+                click.echo(f"{len(failed)} rule(s) failed.")
+
+        sys.exit(1 if any(not r.passed for r in results) else 0)
 
     @cli.command()
     @click.argument("conf_dir", type=click.Path(exists=True))

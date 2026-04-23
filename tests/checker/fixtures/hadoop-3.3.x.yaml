@@ -1,0 +1,43 @@
+rules:
+  - id: hdfs-replication-max
+    description: dfs.replication must not exceed dfs.replication.max
+    type: constraint
+    key: dfs.replication
+    service: namenode
+    relation: lte
+    target_key: dfs.replication.max
+    target_service: namenode
+    severity: critical
+
+  - id: yarn-scheduler-ceiling
+    description: scheduler max allocation must not exceed NM total memory
+    type: constraint
+    key: yarn.scheduler.maximum-allocation-mb
+    service: resourcemanager
+    relation: lte
+    target_key: yarn.nodemanager.resource.memory-mb
+    target_service: nodemanager
+    severity: critical
+
+  - id: fs-defaultfs-propagation
+    description: fs.defaultFS must be identical across all services
+    type: propagation
+    key: fs.defaultFS
+    services: [namenode, resourcemanager, nodemanager, hive-server2]
+    severity: critical
+
+  - id: hive-warehouse-namenode
+    description: hive.metastore.warehouse.dir must reference the configured namenode
+    type: propagation
+    key: hive.metastore.warehouse.dir
+    service: hive-server2
+    must_contain_value_of:
+      key: fs.defaultFS
+      service: namenode
+    severity: warning
+
+  - id: dual-source-consistency
+    description: keys present in both XML files and hadoop.env must agree
+    type: propagation
+    sources: [xml_file, env_file]
+    severity: warning

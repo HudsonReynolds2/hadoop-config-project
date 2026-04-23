@@ -139,7 +139,7 @@ services:
       # Safe-mode OFF means the NN has loaded fsimage and is accepting writes
       test: ["CMD-SHELL", "hdfs dfsadmin -safemode get 2>/dev/null | grep -q 'Safe mode is OFF'"]
       interval: 10s
-      timeout: 10s
+      timeout: 20s
       retries: 30
       start_period: 30s
     networks:
