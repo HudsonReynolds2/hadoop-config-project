@@ -7,20 +7,27 @@ set -euo pipefail
 TEST_NAME="01-hdfs"
 TMP=$(mktemp)
 TMP_OUT=$(mktemp)
-HDFS_PATH="/tmp/hdfs-test-$$"
+STAMP=$$
+HDFS_PATH="/tmp/hdfs-test-$STAMP"
+IN_LOCAL="/tmp/in-$STAMP.bin"
+OUT_LOCAL="/tmp/out-$STAMP.bin"
 
 # Generate 1 MB of random bytes
 dd if=/dev/urandom of="$TMP" bs=1024 count=1024 status=none
 
-# Copy into container, put to HDFS, get back, copy out, diff
-docker cp "$TMP" namenode:/tmp/in.bin
-docker exec namenode hdfs dfs -put -f /tmp/in.bin "$HDFS_PATH"
-docker exec namenode hdfs dfs -get "$HDFS_PATH" /tmp/out.bin
-docker cp namenode:/tmp/out.bin "$TMP_OUT"
+# Copy into container, put to HDFS, get back, copy out, diff.
+# Container-side filenames are stamped so parallel/repeated runs don't collide.
+docker cp "$TMP" "namenode:$IN_LOCAL"
+docker exec namenode hdfs dfs -put -f "$IN_LOCAL" "$HDFS_PATH"
+docker exec namenode hdfs dfs -get "$HDFS_PATH" "$OUT_LOCAL"
+docker cp "namenode:$OUT_LOCAL" "$TMP_OUT"
+
+# Cleanup container-side files regardless of outcome
+docker exec namenode rm -f "$IN_LOCAL" "$OUT_LOCAL" >/dev/null 2>&1 || true
+docker exec namenode hdfs dfs -rm -f "$HDFS_PATH" >/dev/null 2>&1 || true
 
 if cmp -s "$TMP" "$TMP_OUT"; then
   echo "[$TEST_NAME] PASS: 1MB round-trip byte-identical"
-  docker exec namenode hdfs dfs -rm -f "$HDFS_PATH" >/dev/null
   rm -f "$TMP" "$TMP_OUT"
   exit 0
 else

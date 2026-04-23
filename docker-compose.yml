@@ -199,7 +199,7 @@ services:
       - ./conf/yarn-site.xml:/opt/hadoop/etc/hadoop/yarn-site.xml:rw
       - ./conf/mapred-site.xml:/opt/hadoop/etc/hadoop/mapred-site.xml:rw
     healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8088'"]
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/resourcemanager/8088'"]
       interval: 10s
       timeout: 10s
       retries: 30
@@ -231,7 +231,7 @@ services:
       - ./conf/yarn-site.xml:/opt/hadoop/etc/hadoop/yarn-site.xml:rw
       - ./conf/mapred-site.xml:/opt/hadoop/etc/hadoop/mapred-site.xml:rw
     healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8042'"]
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/nodemanager/8042'"]
       interval: 10s
       timeout: 10s
       retries: 30
@@ -298,15 +298,29 @@ services:
       - |
         set -e
         ARCHIVE=/tmp/spark-jars.zip
-        if /opt/spark/bin/hadoop fs -test -e /user/spark/spark-jars.zip 2>/dev/null; then
+        WEBHDFS="http://namenode:9870/webhdfs/v1"
+        # WebHDFS check: GETFILESTATUS returns 200 if exists, 404 if not.
+        status=$$(curl -s -o /dev/null -w "%{http_code}" "$$WEBHDFS/user/spark/spark-jars.zip?op=GETFILESTATUS&user.name=root")
+        if [ "$$status" = "200" ]; then
           echo "[spark-archive-init] archive already on HDFS, skipping"
           exit 0
         fi
-        echo "[spark-archive-init] zipping /opt/spark/jars"
-        cd /opt/spark/jars && zip -q $$ARCHIVE *.jar
-        echo "[spark-archive-init] uploading to hdfs:///user/spark/spark-jars.zip"
-        /opt/spark/bin/hadoop fs -mkdir -p /user/spark
-        /opt/spark/bin/hadoop fs -put -f $$ARCHIVE /user/spark/spark-jars.zip
+        echo "[spark-archive-init] packaging /opt/spark/jars into zip"
+        python3 -c "
+        import os, zipfile
+        src = '/opt/spark/jars'
+        with zipfile.ZipFile('$$ARCHIVE', 'w', zipfile.ZIP_STORED) as z:
+            for f in sorted(os.listdir(src)):
+                z.write(os.path.join(src, f), arcname=f)
+        print('[spark-archive-init] archive created')
+        "
+        echo "[spark-archive-init] ensuring /user/spark exists via WebHDFS"
+        curl -sS -X PUT "$$WEBHDFS/user/spark?op=MKDIRS&user.name=root" >/dev/null
+        echo "[spark-archive-init] uploading via WebHDFS two-step CREATE"
+        # WebHDFS PUT ?op=CREATE returns 307 redirect to datanode; -L follows it.
+        # --data-binary @file streams the archive as the request body.
+        curl -sS -L -X PUT -T "$$ARCHIVE" \
+          "$$WEBHDFS/user/spark/spark-jars.zip?op=CREATE&overwrite=true&user.name=root"
         echo "[spark-archive-init] done"
     restart: "no"
     networks:
