@@ -1,53 +1,24 @@
-"""Kafka consumer — ingests snapshots, detects drift, emits reports.
+"""Kafka consumer — ingests snapshots, detects drift, traces root causes.
 
-This module is the central nervous system of the checker.  It maintains an
-in-memory ``SnapshotStore`` of the latest snapshot from every agent, runs
-the drift detector on each incoming update, and writes structured JSON
-reports to stdout (and optionally to an alerts Kafka topic).
+Pipeline on each incoming snapshot:
 
-Architecture
-------------
-The consumer is designed to be horizontally scalable: multiple instances
-can form a Kafka consumer group, each processing a subset of partitions.
-The ``SnapshotStore`` is per-instance (no shared state), so each instance
-sees a consistent view of its own partition set.
-
-The pipeline on each incoming snapshot:
-
-1. Deserialise the ``ConfigSnapshot`` from the Kafka message value.
-2. If a previous snapshot exists for this ``agent_id``, run temporal drift
-   detection (same agent, config changed over time).
-3. Update the store.
-4. Run cross-source drift detection across all snapshots for this service
-   (e.g. XML vs env file for the same service disagree).
-5. Run the validator rule engine against the full store.
-6. Emit all ``DriftResult`` objects as JSON to stdout.
-7. Optionally publish to the ``hadoop-config-alerts`` topic.
+1. Temporal drift detection (same agent, config changed over time).
+2. Update the SnapshotStore.
+3. Cross-source drift (XML vs env vs JVM disagree for same service).
+4. Validator rules (constraint, propagation, dual-source checks).
+5. Causality graph tracing (map drifts to root causes with downstream effects).
+6. Emit structured JSON report to stdout.
+7. Optionally publish to the alerts Kafka topic.
 
 Environment variables
 ---------------------
-CHECKER_KAFKA_BOOTSTRAP
-    Kafka bootstrap server.  Default: ``kafka:9092``
-
-CHECKER_TOPIC
-    Snapshot input topic.  Default: ``hadoop-config-snapshots``
-
-CHECKER_ALERTS_TOPIC
-    Optional alerts output topic.  Default: ``hadoop-config-alerts``
-
-CHECKER_CONSUMER_GROUP
-    Kafka consumer group ID.  Default: ``hadoop-config-checker``
-
-CHECKER_EMIT_ALERTS
-    Set to ``"true"`` to publish drift results to the alerts topic.
-    Default: ``"false"``
-
-CHECKER_RULES_FILE
-    Path to a YAML rule file.  When set, the validator runs on every
-    incoming snapshot.  Default: unset (validator disabled).
-
-CHECKER_LOG_LEVEL
-    Python log level.  Default: ``INFO``
+CHECKER_KAFKA_BOOTSTRAP    Default: kafka:9092
+CHECKER_TOPIC              Default: hadoop-config-snapshots
+CHECKER_ALERTS_TOPIC       Default: hadoop-config-alerts
+CHECKER_CONSUMER_GROUP     Default: hadoop-config-checker
+CHECKER_EMIT_ALERTS        Default: false
+CHECKER_RULES_FILE         Optional YAML rule file path
+CHECKER_LOG_LEVEL          Default: INFO
 """
 
 from __future__ import annotations
@@ -58,11 +29,10 @@ import os
 import signal
 import sys
 import threading
-import time
 from datetime import datetime, timezone
 
 from checker.analysis.drift_detector import detect_cross_source, detect_temporal
-from checker.models import ConfigSnapshot, DriftResult
+from checker.models import ConfigSnapshot, DriftResult, RootCause
 
 logger = logging.getLogger("checker.consumer")
 
@@ -73,45 +43,31 @@ logger = logging.getLogger("checker.consumer")
 
 
 class SnapshotStore:
-    """In-memory store of the latest ``ConfigSnapshot`` per ``agent_id``.
-
-    Thread-safe for the single-consumer-thread model used here (one writer,
-    reads only happen on the same thread), but uses a lock anyway so the
-    class can be safely reused in multi-threaded contexts like tests.
-    """
+    """In-memory store of the latest ``ConfigSnapshot`` per ``agent_id``."""
 
     def __init__(self) -> None:
         self._store: dict[str, ConfigSnapshot] = {}
         self._lock = threading.Lock()
 
     def get(self, agent_id: str) -> ConfigSnapshot | None:
-        """Return the latest snapshot for ``agent_id``, or None."""
         with self._lock:
             return self._store.get(agent_id)
 
     def put(self, snapshot: ConfigSnapshot) -> ConfigSnapshot | None:
-        """Store a snapshot, returning the previous one (or None).
-
-        The caller uses the returned previous snapshot to run temporal
-        drift detection.
-        """
         with self._lock:
             previous = self._store.get(snapshot.agent_id)
             self._store[snapshot.agent_id] = snapshot
             return previous
 
     def snapshots_for_service(self, service: str) -> list[ConfigSnapshot]:
-        """Return all current snapshots tagged with ``service``."""
         with self._lock:
             return [s for s in self._store.values() if s.service == service]
 
     def all_snapshots(self) -> list[ConfigSnapshot]:
-        """Return all current snapshots (copy of values)."""
         with self._lock:
             return list(self._store.values())
 
     def services(self) -> set[str]:
-        """Return the set of distinct service names in the store."""
         with self._lock:
             return {s.service for s in self._store.values()}
 
@@ -124,13 +80,11 @@ class SnapshotStore:
             self._store.clear()
 
     def to_dict(self) -> dict[str, dict]:
-        """Serialise the entire store as ``{agent_id: snapshot_dict}``."""
         with self._lock:
             return {aid: s.to_dict() for aid, s in self._store.items()}
 
     @classmethod
     def from_dict(cls, data: dict[str, dict]) -> "SnapshotStore":
-        """Reconstruct a store from serialised data."""
         store = cls()
         for aid, snap_dict in data.items():
             store.put(ConfigSnapshot.from_dict(snap_dict))
@@ -138,7 +92,7 @@ class SnapshotStore:
 
 
 # ---------------------------------------------------------------------------
-# Drift pipeline (no Kafka dependency — pure logic)
+# Drift pipeline
 # ---------------------------------------------------------------------------
 
 
@@ -146,41 +100,36 @@ def process_snapshot(
     snapshot: ConfigSnapshot,
     store: SnapshotStore,
     rules: list[dict] | None = None,
-) -> list[DriftResult]:
-    """Run the full drift pipeline for one incoming snapshot.
+    graph=None,
+) -> tuple[list[DriftResult], list[RootCause]]:
+    """Run the full pipeline for one incoming snapshot.
 
-    1. Temporal diff against the previous snapshot for this agent.
-    2. Update the store.
-    3. Cross-source diff across all snapshots for this service.
-    4. If rules are provided, run the validator.
-
-    Returns all drift results (may be empty if nothing changed).
+    Returns ``(drift_results, root_causes)``.
     """
     results: list[DriftResult] = []
 
-    # 1. Temporal drift — did this agent's config change since last time?
+    # 1. Temporal drift
     previous = store.get(snapshot.agent_id)
     if previous is not None:
         try:
             temporal = detect_temporal(previous, snapshot)
             results.extend(temporal)
         except ValueError:
-            # agent_id mismatch — shouldn't happen, but don't crash.
             logger.warning(
                 "agent_id mismatch in temporal diff: %s vs %s",
                 previous.agent_id, snapshot.agent_id,
             )
 
-    # 2. Update store (must happen after temporal diff so we compare old vs new).
+    # 2. Update store
     store.put(snapshot)
 
-    # 3. Cross-source drift — do XML/env/JVM sources for this service agree?
+    # 3. Cross-source drift
     service_snaps = store.snapshots_for_service(snapshot.service)
     if len(service_snaps) > 1:
         cross = detect_cross_source(service_snaps)
         results.extend(cross)
 
-    # 4. Validator rules — evaluate against the full store.
+    # 4. Validator rules
     if rules:
         from checker.analysis.validator import validate
 
@@ -189,7 +138,12 @@ def process_snapshot(
             if not vr.passed and vr.drift is not None:
                 results.append(vr.drift)
 
-    return results
+    # 5. Causality graph tracing
+    root_causes: list[RootCause] = []
+    if graph is not None and results:
+        root_causes = graph.trace(results)
+
+    return results, root_causes
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +152,6 @@ def process_snapshot(
 
 
 def format_drift_report(drift: DriftResult) -> dict:
-    """Format a single DriftResult as a structured report dict."""
     return {
         "type": "drift",
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -206,15 +159,21 @@ def format_drift_report(drift: DriftResult) -> dict:
     }
 
 
-def format_summary(results: list[DriftResult], agent_id: str) -> dict:
-    """Format a batch of results into a summary report."""
-    return {
+def format_summary(
+    results: list[DriftResult],
+    agent_id: str,
+    root_causes: list[RootCause] | None = None,
+) -> dict:
+    report = {
         "type": "drift_report",
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "agent_id": agent_id,
         "drift_count": len(results),
         "drifts": [r.to_dict() for r in results],
     }
+    if root_causes:
+        report["root_causes"] = [rc.to_dict() for rc in root_causes]
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -231,13 +190,11 @@ def _ensure_kafka():
         return
     try:
         from kafka import KafkaConsumer, KafkaProducer
-
         _kafka_consumer_cls = KafkaConsumer
         _kafka_producer_cls = KafkaProducer
     except ImportError as exc:
         raise RuntimeError(
-            "kafka-python is required for the consumer. "
-            "Install it with:  pip install kafka-python"
+            "kafka-python is required.  pip install kafka-python"
         ) from exc
 
 
@@ -246,7 +203,7 @@ def _env(key: str, default: str) -> str:
 
 
 def run_consumer() -> None:
-    """Entry point: connect to Kafka, consume snapshots, detect drift."""
+    """Entry point: Kafka consumer loop with full pipeline."""
     bootstrap = _env("CHECKER_KAFKA_BOOTSTRAP", "kafka:9092")
     topic = _env("CHECKER_TOPIC", "hadoop-config-snapshots")
     alerts_topic = _env("CHECKER_ALERTS_TOPIC", "hadoop-config-alerts")
@@ -266,16 +223,20 @@ def run_consumer() -> None:
         bootstrap, topic, group_id, emit_alerts,
     )
 
-    # Load rules if configured
+    # Load rules
     rules = None
     if rules_file:
         from checker.analysis.validator import load_rules
-
         try:
             rules = load_rules(rules_file)
             logger.info("loaded %d rules from %s", len(rules), rules_file)
         except Exception as exc:
             logger.error("failed to load rules from %s: %s", rules_file, exc)
+
+    # Initialize causality graph
+    from checker.analysis.causality_graph import CausalityGraph
+    graph = CausalityGraph()
+    logger.info("causality graph initialized with %d edges", len(graph.all_edges()))
 
     _ensure_kafka()
 
@@ -286,10 +247,9 @@ def run_consumer() -> None:
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
         auto_offset_reset="earliest",
         enable_auto_commit=True,
-        consumer_timeout_ms=-1,  # block indefinitely
+        consumer_timeout_ms=-1,
     )
 
-    # Optional alerts producer
     alerts_producer = None
     if emit_alerts:
         try:
@@ -304,7 +264,6 @@ def run_consumer() -> None:
 
     store = SnapshotStore()
 
-    # Graceful shutdown
     shutdown = threading.Event()
 
     def _on_signal(signum, frame):
@@ -331,12 +290,13 @@ def run_consumer() -> None:
                 snap.agent_id, snap.service, snap.source, len(snap.properties),
             )
 
-            results = process_snapshot(snap, store, rules=rules)
+            results, root_causes = process_snapshot(
+                snap, store, rules=rules, graph=graph
+            )
 
             if results:
-                report = format_summary(results, snap.agent_id)
-                report_json = json.dumps(report, sort_keys=True)
-                print(report_json, flush=True)
+                report = format_summary(results, snap.agent_id, root_causes)
+                print(json.dumps(report, sort_keys=True), flush=True)
 
                 if alerts_producer is not None:
                     for drift in results:
@@ -365,22 +325,18 @@ def run_consumer() -> None:
 
 
 # ---------------------------------------------------------------------------
-# One-shot mode — read snapshots from a JSON file and run drift detection.
-# Useful for CI/CD pipelines and offline auditing.
+# One-shot mode
 # ---------------------------------------------------------------------------
 
 
 def run_oneshot(
     snapshot_file: str,
     rules: list[dict] | None = None,
-) -> list[DriftResult]:
-    """Load snapshots from a JSON file and run full drift detection.
+    graph=None,
+) -> tuple[list[DriftResult], list[RootCause]]:
+    """Load snapshots from a JSON file and run the full pipeline.
 
-    The file should contain a JSON object mapping ``agent_id`` to snapshot
-    dicts (the format produced by ``SnapshotStore.to_dict()``), or a JSON
-    array of snapshot dicts.
-
-    Returns all drift results found.
+    Returns ``(all_drifts, all_root_causes)``.
     """
     import pathlib
 
@@ -390,7 +346,6 @@ def run_oneshot(
 
     data = json.loads(path.read_text(encoding="utf-8"))
 
-    # Accept both dict-of-dicts and list-of-dicts formats.
     if isinstance(data, dict):
         snapshots = [ConfigSnapshot.from_dict(v) for v in data.values()]
     elif isinstance(data, list):
@@ -398,14 +353,15 @@ def run_oneshot(
     else:
         raise ValueError(f"expected dict or list in {path}, got {type(data).__name__}")
 
-    # Load all into a store, processing each one through the pipeline.
     store = SnapshotStore()
     all_results: list[DriftResult] = []
+    all_root_causes: list[RootCause] = []
     for snap in snapshots:
-        results = process_snapshot(snap, store, rules=rules)
+        results, rcs = process_snapshot(snap, store, rules=rules, graph=graph)
         all_results.extend(results)
+        all_root_causes.extend(rcs)
 
-    return all_results
+    return all_results, all_root_causes
 
 
 if __name__ == "__main__":
