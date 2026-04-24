@@ -136,10 +136,12 @@ services:
       - ./conf/yarn-site.xml:/opt/hadoop/etc/hadoop/yarn-site.xml:rw
       - ./conf/mapred-site.xml:/opt/hadoop/etc/hadoop/mapred-site.xml:rw
     healthcheck:
-      # Safe-mode OFF means the NN has loaded fsimage and is accepting writes
-      test: ["CMD-SHELL", "hdfs dfsadmin -safemode get 2>/dev/null | grep -q 'Safe mode is OFF'"]
+      # Check the RPC port is accepting connections. Gating on "safe mode OFF"
+      # deadlocks on restart: NN needs the DN to report blocks before it leaves
+      # safe mode, but the DN depends_on namenode:service_healthy to start.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8020'"]
       interval: 10s
-      timeout: 20s
+      timeout: 5s
       retries: 30
       start_period: 30s
     networks:
@@ -388,6 +390,9 @@ services:
         -Djavax.jdo.option.ConnectionPassword=hive
         -Dhive.metastore.warehouse.dir=hdfs://namenode:8020/user/hive/warehouse
         -Dfs.defaultFS=hdfs://namenode:8020
+    # JVM needs more than docker's default 10s to shut down; a SIGKILL'd hive
+    # leaves a stale PID file that blocks restart.
+    stop_grace_period: 60s
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9083'"]
       interval: 10s
@@ -421,6 +426,7 @@ services:
         -Dhive.server2.authentication=NONE
         -Dhive.server2.enable.doAs=false
         -Dfs.defaultFS=hdfs://namenode:8020
+    stop_grace_period: 60s
     healthcheck:
       test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/10000'"]
       interval: 10s
@@ -504,5 +510,6 @@ services:
       - ./conf/mapred-site.xml:/opt/hadoop-conf/mapred-site.xml:ro
       - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
     command: ["tail", "-f", "/dev/null"]
+    stop_grace_period: 30s
     networks:
       - hadoop-net

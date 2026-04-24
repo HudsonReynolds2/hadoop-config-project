@@ -1,0 +1,58 @@
+# Canonical edge set for the CausalityGraph. This is the source of truth
+# that pins the table documented in plan.md §"Causality graph — initial
+# edge set". tests/checker/test_graph_contract.py asserts that the graph
+# constructed by `CausalityGraph()` with no arguments contains exactly
+# this set.
+#
+# If you need to add / remove / change an edge: update this file AND the
+# _DEFAULT_EDGES list in checker/analysis/causality_graph.py AND the table
+# in plan.md. Drift between the three is a bug.
+
+edges:
+  - source_service: namenode
+    source_key: dfs.replication
+    edge_type: constraint
+    target_service: namenode
+    target_key: dfs.replication.max
+
+  - source_service: namenode
+    source_key: dfs.replication
+    edge_type: influence
+    target_service: namenode
+    target_key: hdfs.write.pipeline
+
+  - source_service: namenode
+    source_key: fs.defaultFS
+    edge_type: propagation
+    target_service: hive-server2
+    target_key: fs.defaultFS
+
+  - source_service: namenode
+    source_key: fs.defaultFS
+    edge_type: propagation
+    target_service: spark-client
+    target_key: spark.hadoop.fs.defaultFS
+
+  - source_service: nodemanager
+    source_key: yarn.nodemanager.resource.memory-mb
+    edge_type: constraint
+    target_service: resourcemanager
+    target_key: yarn.scheduler.maximum-allocation-mb
+
+  - source_service: resourcemanager
+    source_key: yarn.scheduler.maximum-allocation-mb
+    edge_type: influence
+    target_service: resourcemanager
+    target_key: container.oom.kill.risk
+
+  - source_service: hive-server2
+    source_key: hive.metastore.uris
+    edge_type: propagation
+    target_service: hive-metastore
+    target_key: metastore.thrift.reachability
+
+  - source_service: namenode
+    source_key: fs.defaultFS
+    edge_type: propagation
+    target_service: hive-metastore
+    target_key: fs.defaultFS
