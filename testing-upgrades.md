@@ -149,6 +149,68 @@ whole reason the env collector has two parsers.
 
 ---
 
+## Findings from Tier A#1 live-stack smoke
+
+The first real run of [tests/07-checker-drift.sh](tests/07-checker-drift.sh)
+against this repo's stack on WSL2 / Docker Desktop surfaced two concrete
+deployment issues the existing pytest suite could not have caught:
+
+### F1. Watchdog does not fire on docker single-file bind mounts (WSL2)
+
+[docker-compose.override.yml](docker-compose.override.yml) mounts each
+XML file individually:
+
+```yaml
+volumes:
+  - ./conf/yarn-site.xml:/opt/hadoop/etc/hadoop/yarn-site.xml:ro
+```
+
+After a host-side in-place edit, the container *sees* the new content
+(the inode is shared), but the agent's `watchdog` observer does not log
+`detected change` — inotify events on single-file bind mounts on 9P /
+Docker Desktop do not propagate. The `~1s` detection claim in
+[README.md](README.md) degrades to the 60s heartbeat path on this setup.
+
+**Consequences.** The smoke script was relaxed to pass on *either*
+watchdog OR heartbeat, and prints which path caught the drift. The
+README's "within ~1s" claim should be tightened to "within one heartbeat
+interval" or the deployment should switch to a directory bind mount.
+
+### F2. Host-side `mv` breaks the bind-mount cache
+
+Using `mv backup file` to restore a configuration file changes the host
+inode. Docker's bind-mount cache is sticky on the original inode, so the
+container continues to see the *old* (now orphaned) inode — at best
+stale, at worst breaking container restarts with:
+
+```
+error mounting ".../docker-desktop-bind-mounts/..." to rootfs at
+"/opt/hadoop/etc/hadoop/yarn-site.xml": no such file or directory
+```
+
+The initial version of the smoke script fell into this trap, which
+required `docker compose up -d --force-recreate agent checker` to
+recover. The script now restores via in-place `printf ... > file` so
+the inode survives.
+
+This is a cluster-operations gotcha worth documenting in
+[Troubleshooting.md](Troubleshooting.md) — anyone editing `conf/` with an
+editor that writes-via-rename (vim, many IDEs) will hit the same
+issue.
+
+### Recommendation
+
+Add to Tier D:
+
+- Switch `docker-compose.override.yml` to bind-mount the whole `./conf/`
+  directory, not individual files. Directory bind mounts propagate
+  inotify events reliably across WSL2 and are immune to inode-swap on
+  host-side edits.
+- Update README's drift-detection claim to "within one heartbeat
+  interval" until the above is in place.
+
+---
+
 ## Execution order
 
 1. Tier B (B3, B4, B5) — fast, in-process, exposes real weaknesses today.
