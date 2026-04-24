@@ -13,6 +13,7 @@ TESTS=(
   04-kafka.sh
   05-zookeeper.sh
   06-spark-yarn.sh
+  07-checker-drift.sh
 )
 
 PASS=()
