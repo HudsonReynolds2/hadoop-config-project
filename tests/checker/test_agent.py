@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from checker.agent import collect_all, _env, _env_int
+from checker.agent import collect_all, _env, _env_int, _collect_xml_snapshots
 
 
 class TestCollectAll:
@@ -106,3 +106,69 @@ class TestEnvHelpers:
     def test_env_int_invalid_falls_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("TEST_INT_XYZ", "not-a-number")
         assert _env_int("TEST_INT_XYZ", 42) == 42
+
+
+class TestCollectXmlSnapshots:
+    """Tests for the internal _collect_xml_snapshots helper."""
+
+    def test_corrupt_xml_skipped_others_collected(self, tmp_path: Path) -> None:
+        """If one XML file is corrupt, the rest should still be collected."""
+        # Write a good file
+        good = tmp_path / "core-site.xml"
+        good.write_text(
+            "<configuration>"
+            "<property><name>fs.defaultFS</name><value>hdfs://nn:8020</value></property>"
+            "</configuration>"
+        )
+        # Write a corrupt file
+        bad = tmp_path / "hdfs-site.xml"
+        bad.write_text("<configuration><property><name>broken")  # truncated
+
+        snapshots = _collect_xml_snapshots(str(tmp_path), "test")
+        assert len(snapshots) == 1
+        assert snapshots[0].properties["fs.defaultFS"] == "hdfs://nn:8020"
+
+    def test_nonexistent_dir_returns_empty(self) -> None:
+        snapshots = _collect_xml_snapshots("/nonexistent/path", "test")
+        assert snapshots == []
+
+    def test_empty_dir_returns_empty(self, tmp_path: Path) -> None:
+        snapshots = _collect_xml_snapshots(str(tmp_path), "test")
+        assert snapshots == []
+
+    def test_non_site_xml_files_ignored(self, tmp_path: Path) -> None:
+        """Only *-site.xml files should be collected."""
+        other = tmp_path / "hadoop-policy.xml"
+        other.write_text(
+            "<configuration>"
+            "<property><name>k</name><value>v</value></property>"
+            "</configuration>"
+        )
+        snapshots = _collect_xml_snapshots(str(tmp_path), "test")
+        assert snapshots == []
+
+
+class TestCollectAllErrorResilience:
+    """Edge cases for the full collect_all pipeline."""
+
+    def test_jvm_flags_with_no_dash_d_produces_no_jvm_snapshot(
+        self, conf_dir: Path
+    ) -> None:
+        """JVM flags with no -D tokens should not add a snapshot."""
+        snapshots = collect_all(
+            str(conf_dir), service="test",
+            jvm_flags="-Xmx2g -verbose:gc",
+        )
+        assert all(s.source != "jvm_flags" for s in snapshots)
+
+    def test_nonexistent_env_file_does_not_crash(
+        self, conf_dir: Path
+    ) -> None:
+        """A missing env file should log a warning, not crash."""
+        snapshots = collect_all(
+            str(conf_dir), service="test",
+            env_path="/nonexistent/hadoop.env",
+        )
+        # Should still have XML snapshots
+        assert len(snapshots) == 5
+        assert all(s.source == "xml_file" for s in snapshots)

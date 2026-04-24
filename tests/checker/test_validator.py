@@ -504,3 +504,4 @@ class TestUnknownRuleType:
         results = validate([rule], store)
         assert results[0].passed is True
         assert "unknown rule type" in results[0].details
+        

@@ -153,3 +153,151 @@ class TestRunOneshot:
     def test_oneshot_missing_file_raises(self):
         with pytest.raises(FileNotFoundError):
             run_oneshot("/tmp/nonexistent-snapshot-file.json")
+
+
+# ---------------------------------------------------------------------------
+# format_drift_report and format_summary
+# ---------------------------------------------------------------------------
+
+
+class TestFormatFunctions:
+    def test_format_drift_report_structure(self):
+        from checker.consumer import format_drift_report
+        from checker.models import DriftResult
+
+        drift = DriftResult(
+            key="fs.defaultFS", service="namenode",
+            source_a="xml_file:core-site.xml", value_a="hdfs://nn:8020",
+            source_b="env_file:hadoop.env", value_b="hdfs://wrong:8020",
+            severity="critical", rule_id="dual-source-consistency",
+        )
+        report = format_drift_report(drift)
+        assert report["type"] == "drift"
+        assert "timestamp" in report
+        assert report["key"] == "fs.defaultFS"
+        assert report["severity"] == "critical"
+        assert report["rule_id"] == "dual-source-consistency"
+
+    def test_format_summary_structure(self):
+        from checker.consumer import format_summary
+        from checker.models import DriftResult, RootCause
+
+        drift = DriftResult(
+            key="k", service="s", source_a="a", value_a="1",
+            source_b="b", value_b="2", severity="warning",
+        )
+        rc = RootCause(key="k", service="s", drift=drift,
+                       downstream_effects=["x:y"], severity="warning")
+        report = format_summary([drift], "agent-1", [rc])
+        assert report["type"] == "drift_report"
+        assert report["agent_id"] == "agent-1"
+        assert report["drift_count"] == 1
+        assert len(report["drifts"]) == 1
+        assert len(report["root_causes"]) == 1
+
+    def test_format_summary_no_root_causes(self):
+        from checker.consumer import format_summary
+        from checker.models import DriftResult
+
+        drift = DriftResult(
+            key="k", service="s", source_a="a", value_a="1",
+            source_b="b", value_b="2", severity="warning",
+        )
+        report = format_summary([drift], "agent-1")
+        assert "root_causes" not in report
+
+    def test_format_summary_empty_drifts(self):
+        from checker.consumer import format_summary
+
+        report = format_summary([], "agent-1")
+        assert report["drift_count"] == 0
+        assert report["drifts"] == []
+
+
+# ---------------------------------------------------------------------------
+# run_oneshot edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestOneshotEdgeCases:
+    def test_oneshot_invalid_json_raises(self, tmp_path):
+        f = tmp_path / "bad.json"
+        f.write_text("not valid json{{{")
+        with pytest.raises(Exception):
+            run_oneshot(str(f))
+
+    def test_oneshot_wrong_type_raises(self, tmp_path):
+        f = tmp_path / "s.json"
+        f.write_text('"just a string"')
+        with pytest.raises(ValueError, match="expected dict or list"):
+            run_oneshot(str(f))
+
+    def test_oneshot_with_rules_and_graph(self, tmp_path):
+        """End-to-end oneshot with all pipeline components."""
+        from checker.analysis.causality_graph import CausalityGraph
+        from checker.analysis.validator import load_rules
+
+        data = {
+            "a": _snap(
+                agent_id="nn-xml", source=SOURCE_XML_FILE, source_path="x",
+                properties={"fs.defaultFS": "hdfs://nn:8020"},
+            ).to_dict(),
+            "b": _snap(
+                agent_id="nn-env", source=SOURCE_ENV_FILE, source_path="e",
+                properties={"fs.defaultFS": "hdfs://wrong:8020"},
+            ).to_dict(),
+        }
+        f = tmp_path / "s.json"
+        f.write_text(json.dumps(data))
+
+        rules_path = Path(__file__).parent / "fixtures" / "hadoop-3.3.x.yaml"
+        rules = load_rules(rules_path)
+        graph = CausalityGraph()
+
+        results, rcs = run_oneshot(str(f), rules=rules, graph=graph)
+        assert any(r.key == "fs.defaultFS" for r in results)
+
+
+# ---------------------------------------------------------------------------
+# SnapshotStore thread safety
+# ---------------------------------------------------------------------------
+
+
+class TestSnapshotStoreThreadSafety:
+    def test_concurrent_put_get_no_corruption(self):
+        """Hammer the store from multiple threads to verify locking."""
+        import threading
+
+        store = SnapshotStore()
+        errors = []
+
+        def writer(thread_id: int):
+            for i in range(100):
+                snap = _snap(
+                    agent_id=f"agent-{thread_id}",
+                    properties={f"key-{i}": f"val-{thread_id}-{i}"},
+                    timestamp=f"2026-01-01T00:00:{i:02d}Z",
+                )
+                store.put(snap)
+
+        def reader(thread_id: int):
+            for _ in range(100):
+                snaps = store.all_snapshots()
+                services = store.services()
+                _ = len(store)
+
+        threads = []
+        for t in range(4):
+            threads.append(threading.Thread(target=writer, args=(t,)))
+            threads.append(threading.Thread(target=reader, args=(t,)))
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        # After all writes, each agent should have its last write
+        for t in range(4):
+            snap = store.get(f"agent-{t}")
+            assert snap is not None
+            assert f"key-99" in snap.properties
