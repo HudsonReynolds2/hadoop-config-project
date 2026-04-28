@@ -305,8 +305,12 @@ def _start_watcher(
     """Start a watchdog observer on ``conf_dir``.
 
     Returns the observer instance (so the caller can stop it), or None if
-    watchdog is not installed.
+    watchdog is not installed or ``conf_dir`` does not exist.
     """
+    if not Path(conf_dir).is_dir():
+        logger.info("conf_dir %s does not exist — file watching disabled", conf_dir)
+        return None
+
     try:
         from watchdog.events import FileSystemEventHandler
         from watchdog.observers import Observer

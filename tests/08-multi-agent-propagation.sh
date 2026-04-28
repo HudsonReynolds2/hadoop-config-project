@@ -127,9 +127,6 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
 done
 
 if [ -z "$SAW_DRIFT" ]; then
-  echo "---- checker logs since $BASELINE ----"
-  docker logs --since "$BASELINE" config-checker 2>&1 | tail -50
-  echo "--------------------------------------"
   fail "checker did not report drift containing 'drifted-namenode' within ${DRIFT_WAIT_SEC}s"
 fi
 echo "[$TEST_NAME] checker reported drift containing the new fs.defaultFS"
@@ -145,9 +142,6 @@ for svc in namenode datanode resourcemanager nodemanager spark-client; do
   fi
 done
 if [ "$SEEN_SERVICES" -lt 2 ]; then
-  echo "---- checker logs since $BASELINE ----"
-  echo "$checker_logs" | tail -60
-  echo "--------------------------------------"
   fail "expected ≥2 distinct services in drift output, saw $SEEN_SERVICES"
 fi
 echo "[$TEST_NAME] drift output names $SEEN_SERVICES services"
