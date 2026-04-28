@@ -80,8 +80,20 @@ done
 echo "[$TEST_NAME] host and all agents agree on baseline: $host_val"
 
 # ---------------------------------------------------------------------------
-# 2. Baseline timestamp.
+# 2. Wait for checker to go quiet, then set baseline.
 # ---------------------------------------------------------------------------
+
+# If a previous test left drift residue in flight, the checker may still be
+# emitting reports. Poll until we see a full quiet second before baselining,
+# so stale reports don't bleed into this test's window.
+QUIET_DEADLINE=$(( $(date +%s) + 30 ))
+while [ "$(date +%s)" -lt "$QUIET_DEADLINE" ]; do
+  probe_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  sleep 1
+  if [ -z "$(docker logs --since "$probe_ts" config-checker 2>&1)" ]; then
+    break
+  fi
+done
 
 BASELINE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 sleep 1
@@ -130,9 +142,6 @@ if [ -z "$SAW_DRIFT" ]; then
   fail "checker did not report drift containing 'drifted-namenode' within ${DRIFT_WAIT_SEC}s"
 fi
 echo "[$TEST_NAME] checker reported drift containing the new fs.defaultFS"
-
-# Re-fetch to pick up any lines that arrived after the loop's last capture.
-checker_logs=$(docker logs --since "$BASELINE" config-checker 2>&1 || true)
 
 # Confirm at least 2 distinct expected agents appear in drift output. The
 # fs-defaultfs-propagation rule reports the disagreement as a single

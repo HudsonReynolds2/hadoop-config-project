@@ -60,8 +60,17 @@ echo "[$TEST_NAME] will set scheduler max to $NEW_SCHED MB (must violate ceiling
 ORIGINAL_CONTENT=$(cat "$YARN_XML")
 
 # ---------------------------------------------------------------------------
-# 2. Baseline timestamp.
+# 2. Wait for checker to go quiet, then set baseline.
 # ---------------------------------------------------------------------------
+
+QUIET_DEADLINE=$(( $(date +%s) + 30 ))
+while [ "$(date +%s)" -lt "$QUIET_DEADLINE" ]; do
+  probe_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  sleep 1
+  if [ -z "$(docker logs --since "$probe_ts" config-checker 2>&1)" ]; then
+    break
+  fi
+done
 
 BASELINE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 sleep 1
@@ -92,9 +101,13 @@ echo "[$TEST_NAME] mutation visible in RM agent: $cont_val"
 
 DEADLINE=$(( $(date +%s) + DRIFT_WAIT_SEC ))
 SAW_RULE=""
+checker_logs=""
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   checker_logs=$(docker logs --since "$BASELINE" config-checker 2>&1 || true)
-  if echo "$checker_logs" | grep -q "yarn-scheduler-ceiling"; then
+  # Require both the rule name and the mutated value in the same snapshot —
+  # avoids a false match on residue from a previous test that fired the rule.
+  if echo "$checker_logs" | grep -q "yarn-scheduler-ceiling" && \
+     echo "$checker_logs" | grep -q "$NEW_SCHED"; then
     SAW_RULE=1
     break
   fi
@@ -102,16 +115,9 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
 done
 
 if [ -z "$SAW_RULE" ]; then
-  fail "checker did not report yarn-scheduler-ceiling within ${DRIFT_WAIT_SEC}s"
+  fail "checker did not report yarn-scheduler-ceiling with value $NEW_SCHED within ${DRIFT_WAIT_SEC}s"
 fi
 
-# Re-fetch to pick up any lines that arrived after the loop's last capture.
-checker_logs=$(docker logs --since "$BASELINE" config-checker 2>&1 || true)
-
-# Confirm the new value is referenced and severity is critical.
-if ! echo "$checker_logs" | grep -q "$NEW_SCHED"; then
-  fail "yarn-scheduler-ceiling fired but output does not reference the new value $NEW_SCHED"
-fi
 if ! echo "$checker_logs" | grep -qiE 'critical'; then
   fail "yarn-scheduler-ceiling fired but severity 'critical' not in output"
 fi

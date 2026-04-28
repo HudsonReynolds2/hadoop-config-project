@@ -113,17 +113,16 @@ echo "[$TEST_NAME] mutation visible in container: 9999"
 DEADLINE=$(( $(date +%s) + DRIFT_WAIT_SEC ))
 SAW_REPUBLISH=""
 WATCHDOG_FIRED=""
+checker_logs=""
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   agent_logs=$(docker logs --since "$BASELINE" config-agent 2>&1 || true)
   if echo "$agent_logs" | grep -q "detected change"; then
     WATCHDOG_FIRED=1
   fi
-  # Either code path ends in "published N snapshot(s)" — watchdog logs
-  # "published N snapshot(s) after file change", heartbeat logs only at
-  # DEBUG, so for heartbeat we detect republish indirectly via the
-  # checker picking up the change.
   checker_logs=$(docker logs --since "$BASELINE" config-checker 2>&1 || true)
-  if echo "$checker_logs" | grep -q 'yarn.scheduler.maximum-allocation-mb'; then
+  # Wait until the report containing the actual mutated value arrives —
+  # earlier snapshots from other agents may mention the key without 9999.
+  if echo "$checker_logs" | grep -q '9999'; then
     SAW_REPUBLISH=1
     break
   fi
@@ -131,26 +130,13 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
 done
 
 if [ -z "$SAW_REPUBLISH" ]; then
-  echo "---- agent logs since $BASELINE ----"
-  docker logs --since "$BASELINE" config-agent 2>&1 | tail -30
-  echo "---- checker logs since $BASELINE ----"
-  docker logs --since "$BASELINE" config-checker 2>&1 | tail -30
-  echo "---------------------------------------"
-  fail "checker did not see the drift within ${DRIFT_WAIT_SEC}s (heartbeat: ~60s, watchdog unreliable on docker single-file bind mounts)"
+  fail "checker did not see drift with value 9999 within ${DRIFT_WAIT_SEC}s (heartbeat: ~60s, watchdog unreliable on docker single-file bind mounts)"
 fi
 
 if [ -n "$WATCHDOG_FIRED" ]; then
   echo "[$TEST_NAME] watchdog fired — drift detected quickly"
 else
   echo "[$TEST_NAME] watchdog did NOT fire; heartbeat caught the drift (expected on WSL2 bind-mounts)"
-fi
-
-# Re-fetch to pick up any lines that arrived after the loop's last capture.
-checker_logs=$(docker logs --since "$BASELINE" config-checker 2>&1 || true)
-
-# Drift output must carry the new value so operators see what changed.
-if ! echo "$checker_logs" | grep -q '9999'; then
-  fail "checker drift log did not include the new value 9999"
 fi
 echo "[$TEST_NAME] checker reported drift including new value 9999"
 
