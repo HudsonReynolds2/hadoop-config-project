@@ -23,7 +23,7 @@ rules:
     description: fs.defaultFS must be identical across all services
     type: propagation
     key: fs.defaultFS
-    services: [namenode, resourcemanager, nodemanager, hive-server2]
+    services: [namenode, resourcemanager, nodemanager, hive-server2, spark-client, datanode, hive-metastore]
     severity: critical
 
   - id: hive-warehouse-namenode
@@ -41,3 +41,43 @@ rules:
     type: propagation
     sources: [xml_file, env_file]
     severity: warning
+
+  # ---------------------------------------------------------------------
+  # Multi-service rules added in the Stage 1 ecosystem upgrade.
+  # These require the matching agent sidecars to be running — see
+  # docker-compose.override.yml. With agents disabled in COMPOSE_PROFILES
+  # the rules will simply skip (passed=True, "key not found") rather
+  # than fail, which is the existing skip convention.
+  # ---------------------------------------------------------------------
+
+  - id: datanode-replication-match
+    description: dfs.replication visible to datanode must match namenode
+    type: propagation
+    key: dfs.replication
+    services: [namenode, datanode]
+    severity: warning
+
+  - id: hive-metastore-uri-consistency
+    description: hive.metastore.uris must agree between hive-server2 and hive-metastore
+    type: propagation
+    key: hive.metastore.uris
+    services: [hive-server2, hive-metastore]
+    severity: critical
+
+  # NOTE: two rules from the original Stage 1.3 plan were deferred:
+  #
+  #   - kafka-zookeeper-connect: ZooKeeper's zoo.cfg has no natural
+  #     counterpart to Kafka's "zookeeper.connect" string. A meaningful
+  #     check would need a port-extracting comparator or a synthetic
+  #     collector-side key, both out of scope for Stage 1.
+  #
+  #   - spark-fs-defaultfs: spark-defaults.conf uses whitespace-separated
+  #     KEY VALUE syntax which the env collector does not parse (it
+  #     requires KEY=VALUE). Adding a Spark-specific collector is out of
+  #     scope for Stage 1. spark-client is instead included in the
+  #     fs-defaultfs-propagation rule above, which compares the XML
+  #     core-site.xml that spark-client mounts.
+  #
+  # The kafka, zookeeper, and spark-client agents still publish XML/env
+  # snapshots and participate in temporal drift, silent-agent (Stage 2.3),
+  # and causality-graph reachability checks.

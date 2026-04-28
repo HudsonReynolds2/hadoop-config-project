@@ -136,14 +136,11 @@ services:
       - ./conf/yarn-site.xml:/opt/hadoop/etc/hadoop/yarn-site.xml:rw
       - ./conf/mapred-site.xml:/opt/hadoop/etc/hadoop/mapred-site.xml:rw
     healthcheck:
-      # Check the RPC port is accepting connections. Gating on "safe mode OFF"
-      # deadlocks on restart: NN needs the DN to report blocks before it leaves
-      # safe mode, but the DN depends_on namenode:service_healthy to start.
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8020'"]
-      interval: 10s
+      test: ["CMD-SHELL", "nc -zv localhost 8020"]
+      interval: 5s
       timeout: 5s
-      retries: 30
-      start_period: 30s
+      retries: 60
+      start_period: 45s
     networks:
       - hadoop-net
 
@@ -158,7 +155,7 @@ services:
     command: ["hdfs", "datanode"]
     depends_on:
       namenode:
-        condition: service_healthy
+        condition: service_started
     ports:
       - "9864:9864"
     env_file:
@@ -169,8 +166,14 @@ services:
       - ./conf/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:rw
       - ./conf/yarn-site.xml:/opt/hadoop/etc/hadoop/yarn-site.xml:rw
       - ./conf/mapred-site.xml:/opt/hadoop/etc/hadoop/mapred-site.xml:rw
+    #healthcheck:
+    #  test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9870'"]
+    #  interval: 10s
+    #  timeout: 5s
+    #  retries: 20
+    #  start_period: 20s
     healthcheck:
-      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9870'"]
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9864'"]  # Changed from 9870
       interval: 10s
       timeout: 5s
       retries: 20
@@ -189,7 +192,7 @@ services:
     command: ["yarn", "resourcemanager"]
     depends_on:
       namenode:
-        condition: service_healthy
+        condition: service_started
     ports:
       - "8088:8088"
       - "8032:8032"
@@ -251,7 +254,7 @@ services:
     user: root
     depends_on:
       namenode:
-        condition: service_healthy
+        condition: service_started
       datanode:
         condition: service_healthy
     volumes:
@@ -348,7 +351,7 @@ services:
       postgres-metastore:
         condition: service_healthy
       namenode:
-        condition: service_healthy
+        condition: service_started
     environment:
       SERVICE_NAME: "schematool"
       DB_DRIVER: "postgres"
@@ -373,7 +376,7 @@ services:
       hive-schema-init:
         condition: service_completed_successfully
       namenode:
-        condition: service_healthy
+        condition: service_started
       datanode:
         condition: service_healthy
     ports:

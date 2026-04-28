@@ -121,6 +121,35 @@ _DEFAULT_EDGES: list[Edge] = [
         target_key="fs.defaultFS",
         description="fs.defaultFS must match in hive-metastore SERVICE_OPTS",
     ),
+    # ---------------------------------------------------------------
+    # Stage 1.4 additions — edges that become meaningful once the new
+    # agent sidecars (kafka, zookeeper, datanode, hive-metastore) are
+    # actually publishing snapshots.
+    # ---------------------------------------------------------------
+    Edge(
+        source_service="kafka",
+        source_key="zookeeper.connect",
+        edge_type=EdgeType.PROPAGATION,
+        target_service="zookeeper",
+        target_key="clientPort",
+        description="kafka's zookeeper.connect must reference a reachable ZooKeeper",
+    ),
+    Edge(
+        source_service="datanode",
+        source_key="dfs.replication",
+        edge_type=EdgeType.INFLUENCE,
+        target_service="namenode",
+        target_key="hdfs.write.pipeline",
+        description="datanode-side replication setting affects the HDFS write pipeline",
+    ),
+    Edge(
+        source_service="hive-metastore",
+        source_key="hive.metastore.uris",
+        edge_type=EdgeType.PROPAGATION,
+        target_service="hive-server2",
+        target_key="hive.metastore.uris",
+        description="metastore URI must agree between hive-metastore and hive-server2",
+    ),
 ]
 
 

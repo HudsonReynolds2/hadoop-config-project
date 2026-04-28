@@ -14,6 +14,9 @@ TESTS=(
   05-zookeeper.sh
   06-spark-yarn.sh
   07-checker-drift.sh
+  08-multi-agent-propagation.sh
+  09-cross-service-constraint.sh
+  10-causality-trace.sh
 )
 
 PASS=()

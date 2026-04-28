@@ -13,10 +13,14 @@ three rule types:
     and nodemanager) work correctly.
 
 ``propagation``
-    Value-agreement rules.  Two sub-types:
+    Value-agreement rules.  Three sub-types:
 
     - **multi-service propagation** (``services`` list): a single key must
       have the same value across all listed services.
+    - **cross-key propagation** (``target`` block): a key on one service
+      must equal a different key on another service (e.g.
+      ``spark.hadoop.fs.defaultFS`` on spark-client must equal
+      ``fs.defaultFS`` on namenode).
     - **must-contain** (``must_contain_value_of``): one key's value must
       appear as a substring of another key's value (e.g. hive warehouse
       dir must contain fs.defaultFS).
@@ -274,11 +278,15 @@ def _eval_propagation(rule: dict, store) -> ValidationResult:
     if "services" in rule:
         return _eval_propagation_multi(rule, store)
 
-    # Sub-type 2: must-contain
+    # Sub-type 2: cross-key propagation (target block)
+    if "target" in rule:
+        return _eval_propagation_cross_key(rule, store)
+
+    # Sub-type 3: must-contain
     if "must_contain_value_of" in rule:
         return _eval_must_contain(rule, store)
 
-    # Sub-type 3: dual-source-consistency (handled by drift_detector)
+    # Sub-type 4: dual-source-consistency (handled by drift_detector)
     if "sources" in rule:
         return _eval_dual_source(rule, store)
 
@@ -287,7 +295,7 @@ def _eval_propagation(rule: dict, store) -> ValidationResult:
         description=rule.get("description", ""),
         passed=True,
         severity=severity,
-        details="propagation rule has no services/must_contain_value_of/sources — skipped",
+        details="propagation rule has no services/target/must_contain_value_of/sources — skipped",
     )
 
 
@@ -334,6 +342,81 @@ def _eval_propagation_multi(rule: dict, store) -> ValidationResult:
             value_a=values[svcs[0]],
             source_b=f"service:{svcs[1]}",
             value_b=values[svcs[1]],
+            severity=severity,
+            rule_id=rule_id,
+        )
+
+    return ValidationResult(
+        rule_id=rule_id,
+        description=rule.get("description", ""),
+        passed=passed,
+        severity=severity,
+        details=details,
+        drift=drift,
+    )
+
+
+def _eval_propagation_cross_key(rule: dict, store) -> ValidationResult:
+    """Cross-key propagation: ``key@service`` must equal ``target.key@target.service``.
+
+    Used when two different keys on two different services must hold the
+    same value (e.g. ``spark.hadoop.fs.defaultFS`` on spark-client must
+    equal ``fs.defaultFS`` on namenode). Symmetric string equality. If
+    either side is missing the rule is skipped (``passed=True`` with a
+    skipped detail) — same convention as the other evaluators.
+    """
+    rule_id = rule["id"]
+    key = rule["key"]
+    service = rule.get("service")
+    severity = rule.get("severity", "warning")
+    target = rule["target"]
+    target_key = target["key"]
+    target_service = target.get("service")
+
+    val = _find_key_by_service(store, key, service) if service else _find_key(store, key)
+    target_val = (
+        _find_key_by_service(store, target_key, target_service)
+        if target_service
+        else _find_key(store, target_key)
+    )
+
+    if val is None:
+        return ValidationResult(
+            rule_id=rule_id,
+            description=rule.get("description", ""),
+            passed=True,
+            severity=severity,
+            details=f"key {key!r} (service={service}) not found, rule skipped",
+        )
+    if target_val is None:
+        return ValidationResult(
+            rule_id=rule_id,
+            description=rule.get("description", ""),
+            passed=True,
+            severity=severity,
+            details=f"target key {target_key!r} (service={target_service}) not found, rule skipped",
+        )
+
+    passed = val == target_val
+
+    if passed:
+        details = (
+            f"{service}:{key}={val!r} == {target_service}:{target_key}={target_val!r}: OK"
+        )
+    else:
+        details = (
+            f"{service}:{key}={val!r} != {target_service}:{target_key}={target_val!r}"
+        )
+
+    drift = None
+    if not passed:
+        drift = DriftResult(
+            key=key,
+            service=service or "unknown",
+            source_a=f"service:{service}:{key}",
+            value_a=val,
+            source_b=f"service:{target_service}:{target_key}",
+            value_b=target_val,
             severity=severity,
             rule_id=rule_id,
         )
