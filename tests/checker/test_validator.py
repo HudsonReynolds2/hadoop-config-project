@@ -3,6 +3,11 @@
 Covers constraint rules, propagation rules, must-contain rules,
 dual-source-consistency delegation, and the acceptance test from plan.md:
 yarn-scheduler-ceiling passes with real values and fails when swapped.
+
+Stage 2 update: ``ValidationResult`` now carries an explicit ``status``
+field with values ``"pass" | "fail" | "skip"``. Tests below assert on
+both ``passed`` (legacy) and ``status`` (new) where the distinction
+matters.
 """
 
 from __future__ import annotations
@@ -12,6 +17,9 @@ from pathlib import Path
 import pytest
 
 from checker.analysis.validator import (
+    STATUS_FAIL,
+    STATUS_PASS,
+    STATUS_SKIP,
     ValidationResult,
     load_rules,
     validate,
@@ -55,12 +63,16 @@ def _store_with(*snapshots: ConfigSnapshot) -> SnapshotStore:
 class TestLoadRules:
     def test_load_real_rules_file(self) -> None:
         # The real rule file lives at project root / rules/hadoop-3.3.x.yaml
-        # but in tests we use the fixture copy.
+        # but in tests we use the fixture copy. Stage 1 grew the rule set
+        # from 5 to 7 (datanode-replication-match and
+        # hive-metastore-uri-consistency); the test asserts on a lower
+        # bound + presence of the canonical rules rather than an exact
+        # count, so future additions don't break it.
         rules_path = Path(__file__).parent / "fixtures" / "hadoop-3.3.x.yaml"
         if not rules_path.exists():
             pytest.skip("fixture rule file not present")
         rules = load_rules(rules_path)
-        assert len(rules) == 5
+        assert len(rules) >= 5
         ids = {r["id"] for r in rules}
         assert "yarn-scheduler-ceiling" in ids
         assert "dual-source-consistency" in ids
@@ -103,6 +115,25 @@ class TestFindKey:
         )
         assert _find_key(store, "missing") is None
 
+    def test_prefer_source_picks_xml_over_env(self) -> None:
+        """Stage 2 source-preference: when the same service has both XML
+        and env-file snapshots with different values for the same key,
+        the XML value wins. This is the fix for test 08/09's
+        non-deterministic source picking."""
+        store = _store_with(
+            _snap(agent_id="a", service="namenode", source=SOURCE_XML_FILE,
+                  properties={"k": "xml-val"}),
+            _snap(agent_id="b", service="namenode", source=SOURCE_ENV_FILE,
+                  properties={"k": "env-val"}),
+        )
+        assert _find_key(
+            store, "k", preferred_service="namenode",
+            prefer_source=SOURCE_XML_FILE,
+        ) == "xml-val"
+        # Without an explicit preference, the default source order
+        # (XML > env > jvm) still wins.
+        assert _find_key(store, "k", preferred_service="namenode") == "xml-val"
+
 
 # ---------------------------------------------------------------------------
 # Constraint rules
@@ -129,6 +160,7 @@ class TestConstraintRules:
         results = validate([rule], store)
         assert len(results) == 1
         assert results[0].passed is True
+        assert results[0].status == STATUS_PASS
         assert "OK" in results[0].details
 
     def test_lte_fails_when_swapped(self) -> None:
@@ -151,6 +183,7 @@ class TestConstraintRules:
         results = validate([rule], store)
         assert len(results) == 1
         assert results[0].passed is False
+        assert results[0].status == STATUS_FAIL
         assert results[0].severity == "critical"
         assert results[0].drift is not None
         assert results[0].drift.rule_id == "yarn-scheduler-ceiling"
@@ -169,6 +202,7 @@ class TestConstraintRules:
         }
         results = validate([rule], store)
         assert results[0].passed is True
+        assert results[0].status == STATUS_PASS
 
     def test_missing_key_skips(self) -> None:
         store = _store_with(_snap(properties={"only": "one"}))
@@ -179,6 +213,7 @@ class TestConstraintRules:
         }
         results = validate([rule], store)
         assert results[0].passed is True
+        assert results[0].status == STATUS_SKIP
         assert "not found" in results[0].details
 
     def test_non_numeric_fails(self) -> None:
@@ -192,6 +227,7 @@ class TestConstraintRules:
         }
         results = validate([rule], store)
         assert results[0].passed is False
+        assert results[0].status == STATUS_FAIL
         assert "non-numeric" in results[0].details
 
     def test_gt_relation(self) -> None:
@@ -213,6 +249,7 @@ class TestConstraintRules:
         }
         results = validate([rule], store)
         assert results[0].passed is False
+        assert results[0].status == STATUS_FAIL
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +274,7 @@ class TestPropagationMultiService:
         }
         results = validate([rule], store)
         assert results[0].passed is True
+        assert results[0].status == STATUS_PASS
 
     def test_disagreement_fails(self) -> None:
         store = _store_with(
@@ -254,7 +292,72 @@ class TestPropagationMultiService:
         }
         results = validate([rule], store)
         assert results[0].passed is False
+        assert results[0].status == STATUS_FAIL
         assert results[0].drift is not None
+
+    def test_disagreement_reports_actual_disagreeing_pair(self) -> None:
+        """Stage 2 fix for test 08: when 3 services publish and the
+        first two happen to agree but the third disagrees, the
+        DriftResult must report the *actual* disagreeing pair, not
+        svcs[0]/svcs[1] blindly."""
+        store = _store_with(
+            _snap(agent_id="a", service="namenode",
+                  properties={"fs.defaultFS": "hdfs://nn:8020"}),
+            _snap(agent_id="b", service="resourcemanager",
+                  properties={"fs.defaultFS": "hdfs://nn:8020"}),
+            _snap(agent_id="c", service="datanode",
+                  properties={"fs.defaultFS": "hdfs://drifted:8020"}),
+        )
+        rule = {
+            "id": "fs-defaultfs-propagation",
+            "type": "propagation",
+            "key": "fs.defaultFS",
+            "services": ["namenode", "resourcemanager", "datanode"],
+            "severity": "critical",
+        }
+        results = validate([rule], store)
+        assert results[0].passed is False
+        d = results[0].drift
+        assert d is not None
+        # The reported pair must contain the disagreeing values, not two
+        # services that happen to agree.
+        assert d.value_a != d.value_b
+        # One side must reference the drifted value.
+        values = {d.value_a, d.value_b}
+        assert "hdfs://drifted:8020" in values
+        assert "hdfs://nn:8020" in values
+
+    def test_xml_preferred_over_env_when_both_present(self) -> None:
+        """Stage 2 fix for test 08/09: when the same service has both an
+        XML and an env-file snapshot with different values (e.g.
+        mid-mutation), the XML value is what the propagation rule
+        compares. Without this, the rule could fire spuriously when
+        XML and env disagree but XMLs across services actually agree."""
+        store = _store_with(
+            _snap(agent_id="a-xml", service="namenode", source=SOURCE_XML_FILE,
+                  source_path="core-site.xml",
+                  properties={"fs.defaultFS": "hdfs://nn:8020"}),
+            _snap(agent_id="a-env", service="namenode", source=SOURCE_ENV_FILE,
+                  source_path="hadoop.env",
+                  properties={"fs.defaultFS": "hdfs://stale:8020"}),
+            _snap(agent_id="b-xml", service="resourcemanager", source=SOURCE_XML_FILE,
+                  source_path="core-site.xml",
+                  properties={"fs.defaultFS": "hdfs://nn:8020"}),
+            _snap(agent_id="b-env", service="resourcemanager", source=SOURCE_ENV_FILE,
+                  source_path="hadoop.env",
+                  properties={"fs.defaultFS": "hdfs://stale:8020"}),
+        )
+        rule = {
+            "id": "fs-defaultfs-propagation",
+            "type": "propagation",
+            "key": "fs.defaultFS",
+            "services": ["namenode", "resourcemanager"],
+            "severity": "critical",
+        }
+        results = validate([rule], store)
+        # Both services' XMLs say hdfs://nn:8020; rule passes.
+        assert results[0].passed is True
+        assert results[0].status == STATUS_PASS
 
     def test_single_service_present_still_passes_via_fallback(self) -> None:
         """When only one service is in the store, the fallback lookup finds
@@ -287,6 +390,7 @@ class TestPropagationMultiService:
         }
         results = validate([rule], store)
         assert results[0].passed is True
+        assert results[0].status == STATUS_SKIP
         assert "nothing to compare" in results[0].details
 
 
@@ -318,6 +422,7 @@ class TestMustContain:
         }
         results = validate([rule], store)
         assert results[0].passed is True
+        assert results[0].status == STATUS_PASS
 
     def test_not_contains_fails(self) -> None:
         store = _store_with(
@@ -341,7 +446,39 @@ class TestMustContain:
         }
         results = validate([rule], store)
         assert results[0].passed is False
+        assert results[0].status == STATUS_FAIL
         assert results[0].drift is not None
+
+    def test_url_authority_match_rejects_substring_lookalike(self) -> None:
+        """Stage 2.1 fix: ``hdfs://notnamenode:8020`` was previously
+        accepted as containing ``hdfs://namenode:8020`` because
+        ``ref_val in val`` is a substring match. URL-authority comparison
+        rejects it correctly."""
+        store = _store_with(
+            _snap(agent_id="a", service="hive-server2", properties={
+                "hive.metastore.warehouse.dir":
+                    "hdfs://notnamenode:8020/user/hive/warehouse",
+            }),
+            _snap(agent_id="b", service="namenode", properties={
+                "fs.defaultFS": "hdfs://namenode:8020",
+            }),
+        )
+        rule = {
+            "id": "hive-warehouse-namenode",
+            "type": "propagation",
+            "key": "hive.metastore.warehouse.dir",
+            "service": "hive-server2",
+            "must_contain_value_of": {
+                "key": "fs.defaultFS",
+                "service": "namenode",
+            },
+            "severity": "warning",
+        }
+        results = validate([rule], store)
+        # Old (buggy) behaviour: passed=True via substring match.
+        # New behaviour: passed=False via URL-authority comparison.
+        assert results[0].passed is False
+        assert results[0].status == STATUS_FAIL
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +605,9 @@ class TestAcceptance:
         """Run the entire rule set against the real fixtures.
 
         With the current config, all rules should pass (the cluster is
-        intentionally consistent).
+        intentionally consistent). 'Pass' here includes 'skip' — rules
+        that can't evaluate because not all required services are
+        publishing snapshots.
         """
         from checker.collectors.xml_collector import collect_xml
         from checker.collectors.env_collector import parse_env_file
@@ -485,7 +624,7 @@ class TestAcceptance:
             pytest.skip("fixture rule file not present")
 
         results = validate_from_file(rules_path, store)
-        failed = [r for r in results if not r.passed]
+        failed = [r for r in results if r.status == STATUS_FAIL]
         assert failed == [], (
             f"rules failed against real config: "
             f"{[(r.rule_id, r.details) for r in failed]}"
@@ -503,5 +642,5 @@ class TestUnknownRuleType:
         rule = {"id": "test", "type": "banana", "severity": "info"}
         results = validate([rule], store)
         assert results[0].passed is True
+        assert results[0].status == STATUS_SKIP
         assert "unknown rule type" in results[0].details
-        

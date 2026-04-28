@@ -6,9 +6,10 @@ Pipeline on each incoming snapshot:
 2. Update the SnapshotStore.
 3. Cross-source drift (XML vs env vs JVM disagree for same service).
 4. Validator rules (constraint, propagation, dual-source checks).
-5. Causality graph tracing (map drifts to root causes with downstream effects).
-6. Emit structured JSON report to stdout.
-7. Optionally publish to the alerts Kafka topic.
+5. Silent-agent detection (any known agent gone quiet?).
+6. Causality graph tracing (map drifts to root causes with downstream effects).
+7. Emit structured JSON report to stdout.
+8. Optionally publish to the alerts Kafka topic.
 
 Environment variables
 ---------------------
@@ -18,6 +19,8 @@ CHECKER_ALERTS_TOPIC       Default: hadoop-config-alerts
 CHECKER_CONSUMER_GROUP     Default: hadoop-config-checker
 CHECKER_EMIT_ALERTS        Default: false
 CHECKER_RULES_FILE         Optional YAML rule file path
+CHECKER_GRAPH_FILE         Optional YAML causality-graph file path (Stage 2.4)
+CHECKER_HEARTBEAT          Default: 60 (seconds; used by silent-agent check)
 CHECKER_LOG_LEVEL          Default: INFO
 """
 
@@ -29,6 +32,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 
 from checker.analysis.drift_detector import detect_cross_source, detect_temporal
@@ -92,6 +96,95 @@ class SnapshotStore:
 
 
 # ---------------------------------------------------------------------------
+# AgentLivenessTracker — tracks last-seen monotonic time per agent_id.
+# Stage 2.3.
+#
+# Strategy (option a — learn dynamically): every agent that has ever
+# published in this consumer's lifetime is "known". An agent is "silent"
+# when it hasn't published for 2 × CHECKER_HEARTBEAT seconds.
+#
+# Cold-start caveat: a freshly-started consumer doesn't know an agent
+# exists until that agent publishes its first snapshot. An agent that is
+# down at consumer-start time will not be flagged as silent — only one
+# that goes silent AFTER being seen at least once. Documented in
+# OPERATIONS.md.
+# ---------------------------------------------------------------------------
+
+
+class AgentLivenessTracker:
+    """Track last-seen time per agent_id and flag silent agents.
+
+    Times are stored using ``time.monotonic()`` so they're insensitive to
+    wall-clock changes (NTP adjustments, host suspend/resume).
+    """
+
+    SILENT_RULE_ID = "silent-agent"
+    SILENT_KEY = "agent.heartbeat"
+    SILENT_SEVERITY = "critical"
+
+    def __init__(self, heartbeat_seconds: int) -> None:
+        self._heartbeat = heartbeat_seconds
+        # Threshold = 2 × heartbeat per the plan. One missed heartbeat is
+        # noise (clock skew, GC pause); two is a real outage.
+        self._silent_threshold = 2 * heartbeat_seconds
+        self._last_seen: dict[str, float] = {}
+        # Track which agents we've already alerted about, to avoid
+        # spamming the alerts topic every time a new snapshot arrives.
+        # Cleared when the agent is seen again.
+        self._alerted: set[str] = set()
+        # Service tag last associated with each agent_id, for nicer
+        # DriftResult.service field on silent-agent reports.
+        self._last_service: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def record(self, agent_id: str, service: str) -> None:
+        """Record a heartbeat for ``agent_id``."""
+        now = time.monotonic()
+        with self._lock:
+            self._last_seen[agent_id] = now
+            self._last_service[agent_id] = service
+            # Re-arm: if the agent comes back, we'll alert again on next
+            # silence. Idempotent.
+            self._alerted.discard(agent_id)
+
+    def find_silent(self, now: float | None = None) -> list[DriftResult]:
+        """Return DriftResult entries for any newly-silent agents.
+
+        Each agent is reported at most once per silent period — the
+        agent's name is added to ``_alerted`` so subsequent calls don't
+        re-emit. ``record()`` clears the set, so an agent that comes back
+        and goes silent again is reported again.
+        """
+        if now is None:
+            now = time.monotonic()
+        out: list[DriftResult] = []
+        with self._lock:
+            for agent_id, last_seen in self._last_seen.items():
+                age = now - last_seen
+                if age <= self._silent_threshold:
+                    continue
+                if agent_id in self._alerted:
+                    continue
+                self._alerted.add(agent_id)
+                service = self._last_service.get(agent_id, "unknown")
+                out.append(DriftResult(
+                    key=self.SILENT_KEY,
+                    service=service,
+                    source_a=f"agent:{agent_id}",
+                    value_a=f"last_seen={last_seen:.1f} (monotonic)",
+                    source_b="expected:heartbeat",
+                    value_b=f"≤{self._silent_threshold:.0f}s ago",
+                    severity=self.SILENT_SEVERITY,
+                    rule_id=self.SILENT_RULE_ID,
+                ))
+        return out
+
+    def known_agents(self) -> set[str]:
+        with self._lock:
+            return set(self._last_seen.keys())
+
+
+# ---------------------------------------------------------------------------
 # Drift pipeline
 # ---------------------------------------------------------------------------
 
@@ -101,6 +194,7 @@ def process_snapshot(
     store: SnapshotStore,
     rules: list[dict] | None = None,
     graph=None,
+    liveness: AgentLivenessTracker | None = None,
 ) -> tuple[list[DriftResult], list[RootCause]]:
     """Run the full pipeline for one incoming snapshot.
 
@@ -120,8 +214,10 @@ def process_snapshot(
                 previous.agent_id, snapshot.agent_id,
             )
 
-    # 2. Update store
+    # 2. Update store + record heartbeat for liveness.
     store.put(snapshot)
+    if liveness is not None:
+        liveness.record(snapshot.agent_id, snapshot.service)
 
     # 3. Cross-source drift
     service_snaps = store.snapshots_for_service(snapshot.service)
@@ -138,7 +234,19 @@ def process_snapshot(
             if not vr.passed and vr.drift is not None:
                 results.append(vr.drift)
 
-    # 5. Causality graph tracing
+    # 5. Silent-agent detection — runs on every snapshot, cheap (just a
+    # dict scan). Reports each newly-silent agent at most once.
+    if liveness is not None:
+        silent = liveness.find_silent()
+        if silent:
+            results.extend(silent)
+            for d in silent:
+                logger.warning(
+                    "silent-agent detected: %s (rule_id=%s)",
+                    d.source_a, d.rule_id,
+                )
+
+    # 6. Causality graph tracing
     root_causes: list[RootCause] = []
     if graph is not None and results:
         root_causes = graph.trace(results)
@@ -211,6 +319,7 @@ def run_consumer() -> None:
     emit_alerts = _env("CHECKER_EMIT_ALERTS", "false").lower() == "true"
     log_level = _env("CHECKER_LOG_LEVEL", "INFO")
     rules_file = os.environ.get("CHECKER_RULES_FILE")
+    heartbeat = int(_env("CHECKER_HEARTBEAT", "60"))
 
     logging.basicConfig(
         level=getattr(logging, log_level.upper(), logging.INFO),
@@ -219,8 +328,8 @@ def run_consumer() -> None:
     )
 
     logger.info(
-        "consumer starting: kafka=%s topic=%s group=%s alerts=%s",
-        bootstrap, topic, group_id, emit_alerts,
+        "consumer starting: kafka=%s topic=%s group=%s alerts=%s heartbeat=%ds",
+        bootstrap, topic, group_id, emit_alerts, heartbeat,
     )
 
     # Load rules
@@ -233,10 +342,13 @@ def run_consumer() -> None:
         except Exception as exc:
             logger.error("failed to load rules from %s: %s", rules_file, exc)
 
-    # Initialize causality graph
+    # Initialize causality graph (Stage 2.4: honour CHECKER_GRAPH_FILE).
     from checker.analysis.causality_graph import CausalityGraph
-    graph = CausalityGraph()
+    graph = CausalityGraph.load_default()
     logger.info("causality graph initialized with %d edges", len(graph.all_edges()))
+
+    # Liveness tracker (Stage 2.3).
+    liveness = AgentLivenessTracker(heartbeat_seconds=heartbeat)
 
     _ensure_kafka()
 
@@ -291,7 +403,7 @@ def run_consumer() -> None:
             )
 
             results, root_causes = process_snapshot(
-                snap, store, rules=rules, graph=graph
+                snap, store, rules=rules, graph=graph, liveness=liveness,
             )
 
             if results:

@@ -11,9 +11,11 @@ a type (constraint, influence, propagation) and a human-readable
 description. Some edges target a concrete ``(service, key)`` pair; others
 target a descriptive string (e.g. ``"HDFS write pipeline"``).
 
-The graph is seeded with the initial edge set from plan.md. Users of the
-library can add custom edges via ``CausalityGraph.add_edge()`` or by
-loading additional edge definitions from YAML.
+The graph is seeded with the initial edge set (``_DEFAULT_EDGES``) which
+is the source of truth for tests. ``rules/causality-graph.yaml`` mirrors
+this list and is what operators edit at runtime — see
+``CausalityGraph.from_yaml()`` and the ``CHECKER_GRAPH_FILE`` env var
+honoured by ``CausalityGraph.load_default()``.
 
 Trace algorithm
 ---------------
@@ -25,10 +27,14 @@ that collects all reachable nodes from each drifting key.
 
 from __future__ import annotations
 
+import logging
+import os
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from checker.models import DriftResult, EdgeType, RootCause
+
+logger = logging.getLogger("checker.causality_graph")
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +60,13 @@ Node = tuple[str, str]  # (service, key)
 
 # ---------------------------------------------------------------------------
 # Default edge set from plan.md
+#
+# This list is the source of truth for the test suite (see
+# tests/checker/test_graph_contract.py and
+# tests/checker/fixtures/expected-graph-edges.yaml). The matching YAML
+# file at rules/causality-graph.yaml mirrors this list and is what
+# operators edit; the consumer loads the YAML when CHECKER_GRAPH_FILE is
+# set, otherwise it uses this Python list.
 # ---------------------------------------------------------------------------
 
 _DEFAULT_EDGES: list[Edge] = [
@@ -327,3 +340,35 @@ class CausalityGraph:
                 description=raw.get("description", ""),
             ))
         return cls(edges=edges)
+
+    @classmethod
+    def load_default(cls) -> "CausalityGraph":
+        """Load the graph honouring the ``CHECKER_GRAPH_FILE`` env var.
+
+        Stage 2.4: if ``CHECKER_GRAPH_FILE`` points to an existing YAML
+        file, load from it. Otherwise fall back to the compiled
+        ``_DEFAULT_EDGES`` list. Used by the consumer entry point.
+        """
+        path = os.environ.get("CHECKER_GRAPH_FILE")
+        if path:
+            from pathlib import Path as P
+            if P(path).is_file():
+                try:
+                    g = cls.from_yaml(path)
+                    logger.info(
+                        "loaded causality graph from %s (%d edges)",
+                        path, len(g.all_edges()),
+                    )
+                    return g
+                except Exception as exc:
+                    logger.warning(
+                        "failed to load causality graph from %s: %s — "
+                        "falling back to compiled defaults",
+                        path, exc,
+                    )
+            else:
+                logger.warning(
+                    "CHECKER_GRAPH_FILE=%s does not exist — "
+                    "using compiled defaults", path,
+                )
+        return cls()

@@ -49,6 +49,25 @@ service-specific snapshot is preferred if one matches the rule's service
 field.  Otherwise the first match wins.  This is consistent with
 last-writer-wins in the store and with the fact that bind-mounted files
 produce identical values across services.
+
+**Stage 2 source-preference layer (added 2026-04-28):**
+Each agent now publishes both an XML snapshot and an env-file snapshot for
+the same service.  When those two disagree (e.g. mid-mutation, or because
+hadoop.env still holds the old value while core-site.xml has been
+edited), an unscoped lookup would return whichever snapshot happened to be
+iterated first — non-deterministic, and the source of the test 08/09
+failures.  ``_find_key`` now accepts a ``prefer_source`` argument so
+callers can prefer ``xml_file`` (the cluster's authoritative source for
+*-site.xml keys) over ``env_file``/``jvm_flags``.  Multi-service
+propagation rules use ``prefer_source="xml_file"`` so that they compare
+XML to XML across services rather than mixing sources.
+
+**Stage 2 status field (added 2026-04-28):**
+``ValidationResult`` now carries a ``status`` field with values
+``"pass" | "fail" | "skip"``.  ``passed=True`` is now ambiguous on its own
+(could be pass-because-evaluated or pass-because-skipped); ``status``
+disambiguates.  Existing assertions on ``passed`` are kept working for
+backwards compatibility.
 """
 
 from __future__ import annotations
@@ -59,8 +78,14 @@ import logging
 import operator
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
-from checker.models import DriftResult
+from checker.models import (
+    DriftResult,
+    SOURCE_ENV_FILE,
+    SOURCE_JVM_FLAGS,
+    SOURCE_XML_FILE,
+)
 
 logger = logging.getLogger("checker.validator")
 
@@ -68,6 +93,15 @@ logger = logging.getLogger("checker.validator")
 # ---------------------------------------------------------------------------
 # ValidationResult — one per rule evaluation
 # ---------------------------------------------------------------------------
+
+
+# Status values for ValidationResult.status.
+# - PASS: rule was evaluated and the constraint held.
+# - FAIL: rule was evaluated and the constraint was violated.
+# - SKIP: rule could not be evaluated (e.g. a referenced key is missing).
+STATUS_PASS = "pass"
+STATUS_FAIL = "fail"
+STATUS_SKIP = "skip"
 
 
 @dataclass
@@ -80,6 +114,10 @@ class ValidationResult:
     severity: str
     details: str = ""
     drift: DriftResult | None = None
+    # Stage 2: explicit status disambiguates skip from pass.
+    # Default ``pass`` so legacy code paths that don't set it are correct
+    # when ``passed=True``; evaluators set this explicitly throughout.
+    status: str = STATUS_PASS
 
     def to_dict(self) -> dict:
         d = dataclasses.asdict(self)
@@ -124,35 +162,120 @@ def load_rules(path: str | Path) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def _find_key(store, key: str, preferred_service: str | None = None) -> str | None:
+# Default source preference order: XML wins over env-file wins over
+# jvm-flags. XML is the authoritative *-site.xml on disk; env-file is
+# typically a docker entrypoint convenience; jvm-flags are last because
+# they may or may not be passed through to the running process depending
+# on the service.
+_DEFAULT_SOURCE_ORDER = (SOURCE_XML_FILE, SOURCE_ENV_FILE, SOURCE_JVM_FLAGS)
+
+
+def _find_key(
+    store,
+    key: str,
+    preferred_service: str | None = None,
+    prefer_source: str | None = None,
+) -> str | None:
     """Find a config key's value across all snapshots in the store.
 
-    If ``preferred_service`` is given and a snapshot tagged with that
-    service contains the key, its value is returned.  Otherwise the first
-    snapshot containing the key wins.
+    Lookup order:
+      1. If ``preferred_service`` is set, search snapshots tagged with that
+         service first. Within that service, snapshots whose ``source``
+         matches ``prefer_source`` (or the default XML > env > jvm order
+         when ``prefer_source`` is None) are preferred.
+      2. Fall back to all snapshots in the store, with the same source
+         preference applied.
 
-    Returns None if the key is not found in any snapshot.
+    Returns None if the key is not found anywhere.
+
+    Source preference exists because each agent publishes both an XML
+    snapshot and an env-file snapshot for the same service; when those
+    disagree, an unscoped first-match lookup is non-deterministic.
     """
-    # First pass: check preferred service
+    # Build the source priority tuple. If the caller specifies a preferred
+    # source, it sits at the head of the priority list.
+    source_order: tuple[str, ...]
+    if prefer_source is not None:
+        source_order = (prefer_source,) + tuple(
+            s for s in _DEFAULT_SOURCE_ORDER if s != prefer_source
+        )
+    else:
+        source_order = _DEFAULT_SOURCE_ORDER
+
+    def _best_in(snaps: list) -> str | None:
+        # Bucket by source and return the highest-priority bucket's value.
+        buckets: dict[str, str] = {}
+        for snap in snaps:
+            if key in snap.properties and snap.source not in buckets:
+                buckets[snap.source] = snap.properties[key]
+        for src in source_order:
+            if src in buckets:
+                return buckets[src]
+        # Fallback: any source not in our priority list (e.g. custom).
+        if buckets:
+            return next(iter(buckets.values()))
+        return None
+
+    # First pass: preferred service.
     if preferred_service:
-        for snap in store.snapshots_for_service(preferred_service):
-            if key in snap.properties:
-                return snap.properties[key]
+        val = _best_in(store.snapshots_for_service(preferred_service))
+        if val is not None:
+            return val
 
-    # Second pass: any service
-    for snap in store.all_snapshots():
-        if key in snap.properties:
-            return snap.properties[key]
-
-    return None
+    # Second pass: any service.
+    return _best_in(store.all_snapshots())
 
 
-def _find_key_by_service(store, key: str, service: str) -> str | None:
+def _find_key_by_service(
+    store,
+    key: str,
+    service: str,
+    prefer_source: str | None = None,
+) -> str | None:
     """Find a key's value specifically from snapshots tagged with ``service``.
 
     Falls back to searching all snapshots if the service has no match.
     """
-    return _find_key(store, key, preferred_service=service)
+    return _find_key(
+        store, key, preferred_service=service, prefer_source=prefer_source
+    )
+
+
+def _find_key_strict_service(
+    store,
+    key: str,
+    service: str,
+    prefer_source: str | None = None,
+) -> str | None:
+    """Find a key's value from snapshots tagged with ``service`` ONLY.
+
+    No fallback to other services. Used by multi-service propagation rules
+    where mixing services would defeat the rule's purpose (we want to
+    detect when service A and service B disagree, so a fallback that
+    silently returns service A's value for service B would mask the bug).
+    """
+    snaps = store.snapshots_for_service(service)
+    if not snaps:
+        return None
+    # Reuse the source-preference logic by limiting lookup to one service.
+    source_order: tuple[str, ...]
+    if prefer_source is not None:
+        source_order = (prefer_source,) + tuple(
+            s for s in _DEFAULT_SOURCE_ORDER if s != prefer_source
+        )
+    else:
+        source_order = _DEFAULT_SOURCE_ORDER
+
+    buckets: dict[str, str] = {}
+    for snap in snaps:
+        if key in snap.properties and snap.source not in buckets:
+            buckets[snap.source] = snap.properties[key]
+    for src in source_order:
+        if src in buckets:
+            return buckets[src]
+    if buckets:
+        return next(iter(buckets.values()))
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -191,8 +314,18 @@ def _eval_constraint(rule: dict, store) -> ValidationResult:
     service = rule.get("service")
     target_service = rule.get("target_service", service)
 
-    val_str = _find_key(store, key, preferred_service=service)
-    target_str = _find_key(store, target_key, preferred_service=target_service)
+    # Prefer XML for both sides — bind-mounted *-site.xml is the
+    # authoritative source for these constraint keys, and we want both
+    # halves of the comparison to reflect the same on-disk reality.
+    val_str = _find_key(
+        store, key, preferred_service=service, prefer_source=SOURCE_XML_FILE
+    )
+    target_str = _find_key(
+        store,
+        target_key,
+        preferred_service=target_service,
+        prefer_source=SOURCE_XML_FILE,
+    )
 
     # If either key is missing, we can't evaluate the rule.
     if val_str is None:
@@ -202,6 +335,7 @@ def _eval_constraint(rule: dict, store) -> ValidationResult:
             passed=True,  # can't fail what we can't check
             severity=severity,
             details=f"key {key!r} not found in store, rule skipped",
+            status=STATUS_SKIP,
         )
     if target_str is None:
         return ValidationResult(
@@ -210,6 +344,7 @@ def _eval_constraint(rule: dict, store) -> ValidationResult:
             passed=True,
             severity=severity,
             details=f"target key {target_key!r} not found in store, rule skipped",
+            status=STATUS_SKIP,
         )
 
     # Parse as numbers
@@ -226,6 +361,7 @@ def _eval_constraint(rule: dict, store) -> ValidationResult:
                 f"cannot compare non-numeric values: "
                 f"{key}={val_str!r}, {target_key}={target_str!r}"
             ),
+            status=STATUS_FAIL,
         )
 
     op_func = _RELATIONS.get(relation)
@@ -236,6 +372,7 @@ def _eval_constraint(rule: dict, store) -> ValidationResult:
             passed=False,
             severity=severity,
             details=f"unknown relation {relation!r}",
+            status=STATUS_FAIL,
         )
 
     passed = op_func(val, target_val)
@@ -266,6 +403,7 @@ def _eval_constraint(rule: dict, store) -> ValidationResult:
         severity=severity,
         details=details,
         drift=drift,
+        status=STATUS_PASS if passed else STATUS_FAIL,
     )
 
 
@@ -296,63 +434,178 @@ def _eval_propagation(rule: dict, store) -> ValidationResult:
         passed=True,
         severity=severity,
         details="propagation rule has no services/target/must_contain_value_of/sources — skipped",
+        status=STATUS_SKIP,
     )
 
 
 def _eval_propagation_multi(rule: dict, store) -> ValidationResult:
-    """fs.defaultFS must be identical across all listed services."""
+    """fs.defaultFS must be identical across all listed services.
+
+    Each service is looked up STRICTLY (no fallback to other services'
+    snapshots) because a fallback would silently return service A's value
+    when checking service B, masking the very disagreement the rule
+    exists to find.
+
+    However, if a service has no snapshots in the store at all (e.g. its
+    agent isn't running), we DO fall back — that's a "rule cannot
+    evaluate this service" condition, not a "disagreement" condition,
+    and the existing test contract (test_single_service_present_still_passes
+    _via_fallback in test_validator.py) requires the fallback path. So
+    the rule here is: strict for services that ARE publishing, fallback
+    only for services that aren't.
+    """
     rule_id = rule["id"]
     key = rule["key"]
     services = rule["services"]
     severity = rule.get("severity", "warning")
 
-    values: dict[str, str] = {}
-    for svc in services:
-        val = _find_key_by_service(store, key, svc)
-        if val is not None:
-            values[svc] = val
+    # values_per_service[svc] = (value, source_used, was_strict)
+    # was_strict tracks whether we got the value from a snapshot tagged
+    # with this exact service (True) or via fallback (False). Disagreement
+    # detection only considers strict matches; fallback matches are used
+    # only as a "best guess" for reporting and to preserve the legacy
+    # "single service in store passes via fallback" behaviour.
+    strict_values: dict[str, str] = {}
+    fallback_values: dict[str, str] = {}
 
-    if len(values) <= 1:
-        found = list(values.keys())
+    for svc in services:
+        strict = _find_key_strict_service(
+            store, key, svc, prefer_source=SOURCE_XML_FILE
+        )
+        if strict is not None:
+            strict_values[svc] = strict
+        else:
+            fb = _find_key(
+                store, key, preferred_service=svc, prefer_source=SOURCE_XML_FILE
+            )
+            if fb is not None:
+                fallback_values[svc] = fb
+
+    # If fewer than 2 services contributed values total, nothing to compare.
+    total_known = len(strict_values) + len(fallback_values)
+    if total_known <= 1:
+        found = list(strict_values.keys()) + list(fallback_values.keys())
         return ValidationResult(
             rule_id=rule_id,
             description=rule.get("description", ""),
             passed=True,
             severity=severity,
-            details=f"{key!r} found in {len(values)} of {len(services)} services ({found}), nothing to compare",
+            details=(
+                f"{key!r} found in {total_known} of {len(services)} "
+                f"services ({found}), nothing to compare"
+            ),
+            status=STATUS_SKIP,
         )
 
-    unique_vals = set(values.values())
-    passed = len(unique_vals) == 1
+    # Compare strict values amongst themselves first — these are the only
+    # values we trust for detecting genuine disagreement.
+    if len(strict_values) >= 2:
+        unique_strict = set(strict_values.values())
+        if len(unique_strict) == 1:
+            # All strict-publishing services agree. Sanity-check fallbacks
+            # match too, but don't fail on a fallback mismatch (it's noise
+            # from a service that isn't publishing).
+            agreed = next(iter(unique_strict))
+            all_services = list(strict_values.keys()) + list(fallback_values.keys())
+            return ValidationResult(
+                rule_id=rule_id,
+                description=rule.get("description", ""),
+                passed=True,
+                severity=severity,
+                details=f"{key!r} agrees across {all_services}: {agreed!r}",
+                status=STATUS_PASS,
+            )
 
-    if passed:
-        details = f"{key!r} agrees across {list(values.keys())}: {list(unique_vals)[0]!r}"
-    else:
-        pairs = ", ".join(f"{svc}={v!r}" for svc, v in values.items())
+        # Disagreement — find the first pair that actually differs and
+        # report that pair. Reporting svcs[0] vs svcs[1] blindly was the
+        # bug behind test 08: when those two happened to agree but a third
+        # service disagreed, the JSON report showed value_a == value_b.
+        svc_list = list(strict_values.keys())
+        first_a = svc_list[0]
+        val_a = strict_values[first_a]
+        first_b = None
+        val_b = None
+        for svc in svc_list[1:]:
+            if strict_values[svc] != val_a:
+                first_b = svc
+                val_b = strict_values[svc]
+                break
+        if first_b is None:
+            # Defensive: unique_strict had >=2 entries but we couldn't
+            # find a disagreeing pair. Shouldn't happen, but fall back to
+            # svcs[0]/svcs[1].
+            first_b = svc_list[1]
+            val_b = strict_values[first_b]
+
+        pairs = ", ".join(f"{svc}={v!r}" for svc, v in strict_values.items())
         details = f"{key!r} disagrees: {pairs}"
 
-    drift = None
-    if not passed:
-        # Report the first disagreement
-        svcs = list(values.keys())
         drift = DriftResult(
             key=key,
-            service=svcs[0],
-            source_a=f"service:{svcs[0]}",
-            value_a=values[svcs[0]],
-            source_b=f"service:{svcs[1]}",
-            value_b=values[svcs[1]],
+            service=first_a,
+            source_a=f"service:{first_a}",
+            value_a=val_a,
+            source_b=f"service:{first_b}",
+            value_b=val_b,
             severity=severity,
             rule_id=rule_id,
         )
 
+        return ValidationResult(
+            rule_id=rule_id,
+            description=rule.get("description", ""),
+            passed=False,
+            severity=severity,
+            details=details,
+            drift=drift,
+            status=STATUS_FAIL,
+        )
+
+    # Only one service is strictly publishing; the rest fell back. This
+    # matches the legacy "single service in store via fallback" path:
+    # every fallback resolves to the same single source, so trivially
+    # agrees. Pass with a note that explains why.
+    all_values = {**fallback_values, **strict_values}
+    unique = set(all_values.values())
+    if len(unique) == 1:
+        return ValidationResult(
+            rule_id=rule_id,
+            description=rule.get("description", ""),
+            passed=True,
+            severity=severity,
+            details=(
+                f"{key!r} agrees across {list(all_values.keys())}: "
+                f"{next(iter(unique))!r} (only {list(strict_values.keys())} "
+                "strictly publishing, others via fallback)"
+            ),
+            status=STATUS_PASS,
+        )
+
+    # Strict service disagrees with a fallback — possible but unusual,
+    # report it as a disagreement.
+    svc_a = next(iter(strict_values))
+    val_a = strict_values[svc_a]
+    svc_b = next(s for s, v in fallback_values.items() if v != val_a)
+    val_b = fallback_values[svc_b]
+    pairs = ", ".join(f"{svc}={v!r}" for svc, v in all_values.items())
+    drift = DriftResult(
+        key=key,
+        service=svc_a,
+        source_a=f"service:{svc_a}",
+        value_a=val_a,
+        source_b=f"service:{svc_b}(fallback)",
+        value_b=val_b,
+        severity=severity,
+        rule_id=rule_id,
+    )
     return ValidationResult(
         rule_id=rule_id,
         description=rule.get("description", ""),
-        passed=passed,
+        passed=False,
         severity=severity,
-        details=details,
+        details=f"{key!r} disagrees: {pairs}",
         drift=drift,
+        status=STATUS_FAIL,
     )
 
 
@@ -373,11 +626,17 @@ def _eval_propagation_cross_key(rule: dict, store) -> ValidationResult:
     target_key = target["key"]
     target_service = target.get("service")
 
-    val = _find_key_by_service(store, key, service) if service else _find_key(store, key)
+    val = (
+        _find_key_by_service(store, key, service, prefer_source=SOURCE_XML_FILE)
+        if service
+        else _find_key(store, key, prefer_source=SOURCE_XML_FILE)
+    )
     target_val = (
-        _find_key_by_service(store, target_key, target_service)
+        _find_key_by_service(
+            store, target_key, target_service, prefer_source=SOURCE_XML_FILE
+        )
         if target_service
-        else _find_key(store, target_key)
+        else _find_key(store, target_key, prefer_source=SOURCE_XML_FILE)
     )
 
     if val is None:
@@ -387,6 +646,7 @@ def _eval_propagation_cross_key(rule: dict, store) -> ValidationResult:
             passed=True,
             severity=severity,
             details=f"key {key!r} (service={service}) not found, rule skipped",
+            status=STATUS_SKIP,
         )
     if target_val is None:
         return ValidationResult(
@@ -395,6 +655,7 @@ def _eval_propagation_cross_key(rule: dict, store) -> ValidationResult:
             passed=True,
             severity=severity,
             details=f"target key {target_key!r} (service={target_service}) not found, rule skipped",
+            status=STATUS_SKIP,
         )
 
     passed = val == target_val
@@ -428,11 +689,42 @@ def _eval_propagation_cross_key(rule: dict, store) -> ValidationResult:
         severity=severity,
         details=details,
         drift=drift,
+        status=STATUS_PASS if passed else STATUS_FAIL,
     )
 
 
+def _values_url_match(haystack: str, needle: str) -> bool:
+    """Return True iff ``haystack`` references the same authority as ``needle``.
+
+    Used by ``_eval_must_contain`` (Stage 2.1 fix). The previous behaviour
+    was a naked ``needle in haystack`` substring match, which incorrectly
+    accepted ``hdfs://notnamenode:8020`` as containing
+    ``hdfs://namenode:8020`` (the longer string contains the shorter one
+    as a tail substring).
+
+    Rules:
+      1. If both values parse as URLs with non-empty netlocs, compare the
+         netloc (host:port) for equality.
+      2. Otherwise fall back to substring containment (legacy behaviour),
+         so non-URL must-contain rules — if any are added later — still
+         work.
+    """
+    needle_url = urlparse(needle)
+    haystack_url = urlparse(haystack)
+    if needle_url.netloc and haystack_url.netloc:
+        # URL-authority comparison: scheme need not match (some tools
+        # mix file:// vs hdfs://) but host:port must.
+        return needle_url.netloc == haystack_url.netloc
+    return needle in haystack
+
+
 def _eval_must_contain(rule: dict, store) -> ValidationResult:
-    """hive.metastore.warehouse.dir must contain the value of fs.defaultFS."""
+    """hive.metastore.warehouse.dir must contain the value of fs.defaultFS.
+
+    Stage 2.1: the comparison is now URL-authority-based when both sides
+    parse as URLs, fixing the false-positive on ``hdfs://notnamenode:8020``
+    vs ``hdfs://namenode:8020``. See ``_values_url_match``.
+    """
     rule_id = rule["id"]
     key = rule["key"]
     service = rule.get("service")
@@ -441,8 +733,12 @@ def _eval_must_contain(rule: dict, store) -> ValidationResult:
     ref_key = ref["key"]
     ref_service = ref.get("service")
 
-    val = _find_key(store, key, preferred_service=service)
-    ref_val = _find_key(store, ref_key, preferred_service=ref_service)
+    val = _find_key(
+        store, key, preferred_service=service, prefer_source=SOURCE_XML_FILE
+    )
+    ref_val = _find_key(
+        store, ref_key, preferred_service=ref_service, prefer_source=SOURCE_XML_FILE
+    )
 
     if val is None:
         return ValidationResult(
@@ -451,6 +747,7 @@ def _eval_must_contain(rule: dict, store) -> ValidationResult:
             passed=True,
             severity=severity,
             details=f"key {key!r} not found, rule skipped",
+            status=STATUS_SKIP,
         )
     if ref_val is None:
         return ValidationResult(
@@ -459,14 +756,15 @@ def _eval_must_contain(rule: dict, store) -> ValidationResult:
             passed=True,
             severity=severity,
             details=f"reference key {ref_key!r} not found, rule skipped",
+            status=STATUS_SKIP,
         )
 
-    passed = ref_val in val
+    passed = _values_url_match(val, ref_val)
 
     if passed:
-        details = f"{key}={val!r} contains {ref_key}={ref_val!r}: OK"
+        details = f"{key}={val!r} matches {ref_key}={ref_val!r}: OK"
     else:
-        details = f"{key}={val!r} does NOT contain {ref_key}={ref_val!r}"
+        details = f"{key}={val!r} does NOT match {ref_key}={ref_val!r}"
 
     drift = None
     if not passed:
@@ -488,6 +786,7 @@ def _eval_must_contain(rule: dict, store) -> ValidationResult:
         severity=severity,
         details=details,
         drift=drift,
+        status=STATUS_PASS if passed else STATUS_FAIL,
     )
 
 
@@ -508,6 +807,7 @@ def _eval_dual_source(rule: dict, store) -> ValidationResult:
             passed=True,
             severity=severity,
             details="all cross-source keys agree",
+            status=STATUS_PASS,
         )
 
     keys = sorted({d.key for d in drifts})
@@ -518,6 +818,7 @@ def _eval_dual_source(rule: dict, store) -> ValidationResult:
         severity=severity,
         details=f"{len(drifts)} cross-source disagreement(s) on: {', '.join(keys)}",
         drift=drifts[0],  # attach the first one for reporting
+        status=STATUS_FAIL,
     )
 
 
@@ -559,6 +860,7 @@ def validate(rules: list[dict], store) -> list[ValidationResult]:
                 passed=True,
                 severity=rule.get("severity", "warning"),
                 details=f"unknown rule type {rule_type!r}, skipped",
+                status=STATUS_SKIP,
             ))
             continue
         try:
@@ -572,6 +874,7 @@ def validate(rules: list[dict], store) -> list[ValidationResult]:
                 passed=False,
                 severity=rule.get("severity", "warning"),
                 details=f"evaluation error: {exc}",
+                status=STATUS_FAIL,
             ))
     return results
 

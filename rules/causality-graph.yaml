@@ -1,0 +1,115 @@
+# Causality graph for the hadoop-config-checker.
+#
+# This file is the runtime-editable mirror of the _DEFAULT_EDGES list in
+# checker/analysis/causality_graph.py. The consumer loads this file when
+# the CHECKER_GRAPH_FILE env var points to it; otherwise it uses the
+# compiled-in defaults. Both should be kept in sync — the test contract
+# (tests/checker/test_graph_contract.py) asserts that the compiled list
+# matches the canonical edge set in
+# tests/checker/fixtures/expected-graph-edges.yaml.
+#
+# Edge types:
+#   constraint  — hard rule. Violation is a definite bug.
+#   influence   — soft relationship. Violation is a probable symptom only.
+#   propagation — value must agree across a service boundary.
+#
+# To add an edge: append it here, append the matching Python entry to
+# _DEFAULT_EDGES, and append it to expected-graph-edges.yaml.
+
+edges:
+  # ===================================================================
+  # HDFS replication
+  # ===================================================================
+
+  - source_service: namenode
+    source_key: dfs.replication
+    edge_type: constraint
+    target_service: namenode
+    target_key: dfs.replication.max
+    description: dfs.replication must be ≤ dfs.replication.max
+
+  - source_service: namenode
+    source_key: dfs.replication
+    edge_type: influence
+    target_service: namenode
+    target_key: hdfs.write.pipeline
+    description: higher replication = more ack round trips
+
+  - source_service: datanode
+    source_key: dfs.replication
+    edge_type: influence
+    target_service: namenode
+    target_key: hdfs.write.pipeline
+    description: datanode-side replication setting affects the HDFS write pipeline
+
+  # ===================================================================
+  # fs.defaultFS propagation
+  # ===================================================================
+
+  - source_service: namenode
+    source_key: fs.defaultFS
+    edge_type: propagation
+    target_service: hive-server2
+    target_key: fs.defaultFS
+    description: fs.defaultFS must match across core-site and hive SERVICE_OPTS
+
+  - source_service: namenode
+    source_key: fs.defaultFS
+    edge_type: propagation
+    target_service: spark-client
+    target_key: spark.hadoop.fs.defaultFS
+    description: fs.defaultFS must propagate to spark-defaults
+
+  - source_service: namenode
+    source_key: fs.defaultFS
+    edge_type: propagation
+    target_service: hive-metastore
+    target_key: fs.defaultFS
+    description: fs.defaultFS must match in hive-metastore SERVICE_OPTS
+
+  # ===================================================================
+  # YARN scheduler / NodeManager
+  # ===================================================================
+
+  - source_service: nodemanager
+    source_key: yarn.nodemanager.resource.memory-mb
+    edge_type: constraint
+    target_service: resourcemanager
+    target_key: yarn.scheduler.maximum-allocation-mb
+    description: NM total memory must be ≥ scheduler max allocation
+
+  - source_service: resourcemanager
+    source_key: yarn.scheduler.maximum-allocation-mb
+    edge_type: influence
+    target_service: resourcemanager
+    target_key: container.oom.kill.risk
+    description: containers requesting more than scheduler max get killed
+
+  # ===================================================================
+  # Hive metastore
+  # ===================================================================
+
+  - source_service: hive-server2
+    source_key: hive.metastore.uris
+    edge_type: propagation
+    target_service: hive-metastore
+    target_key: metastore.thrift.reachability
+    description: hive.metastore.uris must resolve to a running metastore
+
+  - source_service: hive-metastore
+    source_key: hive.metastore.uris
+    edge_type: propagation
+    target_service: hive-server2
+    target_key: hive.metastore.uris
+    description: metastore URI must agree between hive-metastore and hive-server2
+
+  # ===================================================================
+  # Kafka / ZooKeeper
+  # ===================================================================
+
+  - source_service: kafka
+    source_key: zookeeper.connect
+    edge_type: propagation
+    target_service: zookeeper
+    target_key: clientPort
+    description: kafka's zookeeper.connect must reference a reachable ZooKeeper
