@@ -81,7 +81,7 @@ ORIGINAL_CONTENT=$(cat "$YARN_XML")
 # 2. Baseline offset
 # ---------------------------------------------------------------------------
 
-BASELINE=$(date -u +%Y-%m-%dT%H:%M:%S)
+BASELINE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 sleep 1
 echo "[$TEST_NAME] baseline timestamp: $BASELINE"
 
@@ -155,7 +155,7 @@ echo "[$TEST_NAME] checker reported drift including new value 9999"
 # 5. Restore — in place, same inode.
 # ---------------------------------------------------------------------------
 
-RESTORE_BASELINE=$(date -u +%Y-%m-%dT%H:%M:%S)
+RESTORE_BASELINE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 sleep 1
 restore_yarn_xml
 trap - EXIT  # disarm; we've already restored
@@ -206,7 +206,8 @@ echo "[$TEST_NAME] restore observed by pipeline"
 # 6. Idle-window sanity — no spurious drift in a quiet window.
 # ---------------------------------------------------------------------------
 
-IDLE_BASELINE=$(date -u +%Y-%m-%dT%H:%M:%S)
+sleep 10
+IDLE_BASELINE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 sleep 15
 LOGS=$(docker logs --since "$IDLE_BASELINE" config-checker 2>&1 || true)
 # Drift JSON from format_drift_report includes '"type": "drift"' or
