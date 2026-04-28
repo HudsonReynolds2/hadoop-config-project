@@ -131,6 +131,9 @@ if [ -z "$SAW_DRIFT" ]; then
 fi
 echo "[$TEST_NAME] checker reported drift containing the new fs.defaultFS"
 
+# Re-fetch to pick up any lines that arrived after the loop's last capture.
+checker_logs=$(docker logs --since "$BASELINE" config-checker 2>&1 || true)
+
 # Confirm at least 2 distinct expected agents appear in drift output. The
 # fs-defaultfs-propagation rule reports the disagreement as a single
 # DriftResult, but cross-source / temporal lines should mention multiple

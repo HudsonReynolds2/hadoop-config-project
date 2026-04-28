@@ -145,6 +145,9 @@ else
   echo "[$TEST_NAME] watchdog did NOT fire; heartbeat caught the drift (expected on WSL2 bind-mounts)"
 fi
 
+# Re-fetch to pick up any lines that arrived after the loop's last capture.
+checker_logs=$(docker logs --since "$BASELINE" config-checker 2>&1 || true)
+
 # Drift output must carry the new value so operators see what changed.
 if ! echo "$checker_logs" | grep -q '9999'; then
   fail "checker drift log did not include the new value 9999"

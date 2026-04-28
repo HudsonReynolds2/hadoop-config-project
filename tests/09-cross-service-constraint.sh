@@ -102,11 +102,11 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
 done
 
 if [ -z "$SAW_RULE" ]; then
-  echo "---- checker logs since $BASELINE ----"
-  docker logs --since "$BASELINE" config-checker 2>&1 | tail -40
-  echo "--------------------------------------"
   fail "checker did not report yarn-scheduler-ceiling within ${DRIFT_WAIT_SEC}s"
 fi
+
+# Re-fetch to pick up any lines that arrived after the loop's last capture.
+checker_logs=$(docker logs --since "$BASELINE" config-checker 2>&1 || true)
 
 # Confirm the new value is referenced and severity is critical.
 if ! echo "$checker_logs" | grep -q "$NEW_SCHED"; then
