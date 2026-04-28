@@ -56,3 +56,29 @@ edges:
     edge_type: propagation
     target_service: hive-metastore
     target_key: fs.defaultFS
+
+  # ---------------------------------------------------------------
+  # Stage 1.4 additions — edges that become meaningful once the new
+  # agent sidecars (kafka, zookeeper, datanode, hive-metastore) are
+  # actually publishing snapshots. Mirrored in
+  # checker/analysis/causality_graph.py _DEFAULT_EDGES and in
+  # rules/causality-graph.yaml.
+  # ---------------------------------------------------------------
+
+  - source_service: kafka
+    source_key: zookeeper.connect
+    edge_type: propagation
+    target_service: zookeeper
+    target_key: clientPort
+
+  - source_service: datanode
+    source_key: dfs.replication
+    edge_type: influence
+    target_service: namenode
+    target_key: hdfs.write.pipeline
+
+  - source_service: hive-metastore
+    source_key: hive.metastore.uris
+    edge_type: propagation
+    target_service: hive-server2
+    target_key: hive.metastore.uris

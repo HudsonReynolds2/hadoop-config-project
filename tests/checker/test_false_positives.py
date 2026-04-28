@@ -10,11 +10,9 @@ Covered:
     * baseline conf/env → zero validator failures
     * heartbeat storm → zero temporal drift
     * comment-only / whitespace XML edit → zero drift
-    * ``hive-warehouse-namenode``'s substring match on URLs with a
-      prefix relationship — surfaces a known weakness in the current
-      rule (marked xfail so we can see it flip green if the rule is
-      tightened to URL-authority comparison; see testing-upgrades.md
-      Tier D).
+    * ``hive-warehouse-namenode``'s URL-authority match correctly
+      rejects port-prefix lookalikes (Stage 2.1 — was previously
+      ``xfail`` because the rule used naive substring matching).
 """
 
 from __future__ import annotations
@@ -203,33 +201,27 @@ def test_detect_on_identical_properties_is_silent() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Known-weakness probe: hive-warehouse-namenode uses naive substring match.
-#
-# URL authorities that share a prefix (e.g. port 8020 vs 80201) pass the
-# current rule, which is arguably wrong. Marked xfail(strict=True) so the
-# suite stays green on current behaviour but flips to failure if the rule
-# is ever tightened — that way we see the change landing.
+# Stage 2.1 fix landed: hive-warehouse-namenode now does URL-authority
+# comparison instead of `ref_val in val` substring matching. A warehouse
+# dir whose port string is a prefix of a longer port (e.g. 8020 vs 80201)
+# used to pass the rule incorrectly; it now fails as it should.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "hive-warehouse-namenode uses `ref_val in val` substring match. "
-        "A warehouse dir whose host:port is a prefix of a longer host:port "
-        "passes the rule incorrectly. Tighten to URL-authority comparison "
-        "to fix (see testing-upgrades.md Tier D)."
-    ),
-)
 def test_hive_warehouse_substring_prefix_should_be_rejected(
     tmp_path: Path, conf_dir: Path, hadoop_env_path: Path
 ) -> None:
+    """Verify the URL-authority match rejects a port-prefix lookalike.
+
+    Was ``xfail`` before Stage 2.1 because the old substring match said
+    ``hdfs://namenode:8020`` is contained in
+    ``hdfs://namenode:80201/user/hive/warehouse``. With URL-authority
+    comparison (urlparse().netloc) the rule correctly rejects the
+    mismatch — different ports, different authorities.
+    """
     paths = _copy_fixtures(tmp_path, conf_dir, hadoop_env_path)
 
     # Change the warehouse dir so the port is "80201" instead of "8020/".
-    # The current substring match says "hdfs://namenode:8020" is in
-    # "hdfs://namenode:80201/user/hive/warehouse", so the rule passes —
-    # but the warehouse is on a different host:port than the namenode.
     yarn_xml = paths["conf"] / "hive-site.xml"
     text = yarn_xml.read_text()
     text = re.sub(

@@ -243,7 +243,9 @@ class TestScenarioHiveWarehouseMismatch:
         warehouse = [r for r in results if r.rule_id == "hive-warehouse-namenode"]
         assert len(warehouse) == 1
         assert warehouse[0].passed is False
-        assert "does NOT contain" in warehouse[0].details
+        # Stage 2.1: rule now uses URL-authority comparison; details
+        # phrasing changed from "does NOT contain" to "does NOT match".
+        assert "does NOT match" in warehouse[0].details
 
 
 # ---------------------------------------------------------------------------
