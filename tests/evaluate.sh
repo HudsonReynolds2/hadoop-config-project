@@ -168,15 +168,18 @@ preflight() {
 SNAPSHOT_BACKUP=""
 snapshot_conf() {
   SNAPSHOT_BACKUP=$(mktemp -d -t evaluate-conf-backup-XXXXXX)
-  cp -a "$CONF_DIR/." "$SNAPSHOT_BACKUP/"
+  mkdir -p "$SNAPSHOT_BACKUP/conf" "$SNAPSHOT_BACKUP/root"
+  cp -a "$CONF_DIR/." "$SNAPSHOT_BACKUP/conf/"
+  [ -f "$REPO_ROOT/hadoop.env" ] && cp -a "$REPO_ROOT/hadoop.env" "$SNAPSHOT_BACKUP/root/hadoop.env"
 }
 
 restore_conf() {
   if [ -n "$SNAPSHOT_BACKUP" ] && [ -d "$SNAPSHOT_BACKUP" ]; then
-    for f in "$SNAPSHOT_BACKUP"/*; do
+    for f in "$SNAPSHOT_BACKUP/conf"/*; do
       [ -f "$f" ] || continue
       cp -a "$f" "$CONF_DIR/$(basename "$f")"
     done
+    [ -f "$SNAPSHOT_BACKUP/root/hadoop.env" ] &&       cp -a "$SNAPSHOT_BACKUP/root/hadoop.env" "$REPO_ROOT/hadoop.env"
   fi
 }
 
@@ -298,7 +301,11 @@ run_scenario() {
     case "$base" in
       metadata.env|README.md) continue ;;
     esac
-    diff -u "$CONF_DIR/$base" "$f" >> "$out_dir/inject.diff" || true
+    if [ "$base" = "hadoop.env" ]; then
+      diff -u "$REPO_ROOT/hadoop.env" "$f" >> "$out_dir/inject.diff" || true
+    else
+      diff -u "$CONF_DIR/$base" "$f" >> "$out_dir/inject.diff" || true
+    fi
   done
 
   local baseline_iso
@@ -314,7 +321,11 @@ run_scenario() {
     case "$base" in
       metadata.env|README.md) continue ;;
     esac
-    cp -a "$f" "$CONF_DIR/$base"
+    if [ "$base" = "hadoop.env" ]; then
+      cp -a "$f" "$REPO_ROOT/hadoop.env"
+    else
+      cp -a "$f" "$CONF_DIR/$base"
+    fi
   done
 
   local detected_json=""

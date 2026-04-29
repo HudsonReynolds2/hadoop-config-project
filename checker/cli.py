@@ -242,12 +242,13 @@ def main():
         # Each `status` invocation is a fresh, anonymous group.
         # Rather than replaying the entire topic from the beginning (which
         # accumulates thousands of messages over a long-running cluster),
-        # we seek to messages published within the last 2x timeout window.
+        # we seek to messages published within the last 2x heartbeat window.
         # Every agent republishes its full snapshot on every heartbeat, so
-        # one heartbeat window is enough to see the current state of every
-        # agent. This keeps each status poll fast regardless of topic size.
+        # one heartbeat window is always enough to see every agent's current
+        # state regardless of how long the cluster has been running.
         group_id = f"hadoopconf-status-{int(time.time() * 1000)}"
-        lookback_ms = int(timeout * 1000) * 2
+        heartbeat_ms = int(os.environ.get("CHECKER_HEARTBEAT", "60")) * 1000
+        lookback_ms = heartbeat_ms * 2
         since_ms = int(time.time() * 1000) - lookback_ms
 
         consumer = KafkaConsumer(
