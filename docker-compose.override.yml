@@ -1,0 +1,328 @@
+# docker-compose.override.yml
+#
+# Adds the config-checker agents and consumer to the Hadoop stack.
+#
+# Usage:
+#   docker compose up -d                          # all agents + cluster
+#   docker compose --profile namenode up -d ...   # subset
+#
+# Agent enablement is driven by COMPOSE_PROFILES in .env. Removing a
+# profile name from that list keeps the corresponding agent off the
+# `docker compose up` set; rules that depend on it will skip rather
+# than fail.
+#
+# Mount strategy:
+#   - XML-based agents mount ./conf/ as a directory. This restores
+#     inotify on WSL2/macOS where single-file bind mounts do not
+#     propagate filesystem events.
+#   - Hive agents have no XML conf dir — Hive's config is injected via
+#     SERVICE_OPTS JVM flags in docker-compose.yml. The agents replicate
+#     those flags via CHECKER_JVM_FLAGS so the snapshot reflects what
+#     the Hive process actually sees.
+#   - Kafka and ZooKeeper images generate their broker/server config
+#     from environment variables at start-up; there is no file on disk
+#     that mirrors all of it. The agents therefore replicate the
+#     relevant values via CHECKER_JVM_FLAGS too. This is a known
+#     limitation — see rules/hadoop-3.3.x.yaml for context.
+
+services:
+
+  # =======================================================================
+  # Consumer / checker
+  # =======================================================================
+
+  checker:
+    build:
+      context: .
+      dockerfile: Dockerfile.checker
+    image: hadoop-config-checker:local
+    container_name: config-checker
+    hostname: config-checker
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      CHECKER_KAFKA_BOOTSTRAP: "${CHECKER_KAFKA_BOOTSTRAP:-kafka:9092}"
+      CHECKER_TOPIC: "${CHECKER_TOPIC:-hadoop-config-snapshots}"
+      CHECKER_ALERTS_TOPIC: "hadoop-config-alerts"
+      CHECKER_CONSUMER_GROUP: "hadoop-config-checker"
+      CHECKER_EMIT_ALERTS: "false"
+      CHECKER_RULES_FILE: "/etc/checker/rules/hadoop-3.3.x.yaml"
+      CHECKER_LOG_LEVEL: "${CHECKER_LOG_LEVEL:-INFO}"
+    volumes:
+      - ./rules:/etc/checker/rules:ro
+    restart: unless-stopped
+    networks:
+      - hadoop-net
+
+  # =======================================================================
+  # Backwards-compat alias: the original override defined a single agent
+  # named "agent" tagged as namenode. Several existing tests (07-checker-drift)
+  # reference container_name "config-agent" directly. The namenode agent
+  # below keeps that exact container_name to avoid breaking them.
+  # =======================================================================
+
+  agent-namenode:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: hadoop-config-agent:local
+    container_name: config-agent
+    hostname: config-agent
+    profiles: ["namenode"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      HADOOP_CONF_DIR: "/opt/hadoop/etc/hadoop"
+      CHECKER_KAFKA_BOOTSTRAP: "${CHECKER_KAFKA_BOOTSTRAP:-kafka:9092}"
+      CHECKER_TOPIC: "${CHECKER_TOPIC:-hadoop-config-snapshots}"
+      CHECKER_SERVICE_NAME: "namenode"
+      CHECKER_HEARTBEAT: "${CHECKER_HEARTBEAT:-60}"
+      CHECKER_ENV_FILE: "/etc/checker/hadoop.env"
+      CHECKER_LOG_LEVEL: "${CHECKER_LOG_LEVEL:-INFO}"
+    volumes:
+      - ./conf/:/opt/hadoop/etc/hadoop/:ro
+      - ./hadoop.env:/etc/checker/hadoop.env:ro
+    restart: unless-stopped
+    networks:
+      - hadoop-net
+
+  # =======================================================================
+  # XML-based agents (datanode, resourcemanager, nodemanager, spark-client)
+  # All read the same ./conf/ tree as the cluster services.
+  # =======================================================================
+
+  agent-datanode:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: hadoop-config-agent:local
+    container_name: config-agent-datanode
+    hostname: config-agent-datanode
+    profiles: ["datanode"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      HADOOP_CONF_DIR: "/opt/hadoop/etc/hadoop"
+      CHECKER_KAFKA_BOOTSTRAP: "${CHECKER_KAFKA_BOOTSTRAP:-kafka:9092}"
+      CHECKER_TOPIC: "${CHECKER_TOPIC:-hadoop-config-snapshots}"
+      CHECKER_SERVICE_NAME: "datanode"
+      CHECKER_HEARTBEAT: "${CHECKER_HEARTBEAT:-60}"
+      CHECKER_ENV_FILE: "/etc/checker/hadoop.env"
+      CHECKER_LOG_LEVEL: "${CHECKER_LOG_LEVEL:-INFO}"
+    volumes:
+      - ./conf/:/opt/hadoop/etc/hadoop/:ro
+      - ./hadoop.env:/etc/checker/hadoop.env:ro
+    restart: unless-stopped
+    networks:
+      - hadoop-net
+
+  agent-resourcemanager:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: hadoop-config-agent:local
+    container_name: config-agent-resourcemanager
+    hostname: config-agent-resourcemanager
+    profiles: ["resourcemanager"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      HADOOP_CONF_DIR: "/opt/hadoop/etc/hadoop"
+      CHECKER_KAFKA_BOOTSTRAP: "${CHECKER_KAFKA_BOOTSTRAP:-kafka:9092}"
+      CHECKER_TOPIC: "${CHECKER_TOPIC:-hadoop-config-snapshots}"
+      CHECKER_SERVICE_NAME: "resourcemanager"
+      CHECKER_HEARTBEAT: "${CHECKER_HEARTBEAT:-60}"
+      CHECKER_ENV_FILE: "/etc/checker/hadoop.env"
+      CHECKER_LOG_LEVEL: "${CHECKER_LOG_LEVEL:-INFO}"
+    volumes:
+      - ./conf/:/opt/hadoop/etc/hadoop/:ro
+      - ./hadoop.env:/etc/checker/hadoop.env:ro
+    restart: unless-stopped
+    networks:
+      - hadoop-net
+
+  agent-nodemanager:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: hadoop-config-agent:local
+    container_name: config-agent-nodemanager
+    hostname: config-agent-nodemanager
+    profiles: ["nodemanager"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      HADOOP_CONF_DIR: "/opt/hadoop/etc/hadoop"
+      CHECKER_KAFKA_BOOTSTRAP: "${CHECKER_KAFKA_BOOTSTRAP:-kafka:9092}"
+      CHECKER_TOPIC: "${CHECKER_TOPIC:-hadoop-config-snapshots}"
+      CHECKER_SERVICE_NAME: "nodemanager"
+      CHECKER_HEARTBEAT: "${CHECKER_HEARTBEAT:-60}"
+      CHECKER_ENV_FILE: "/etc/checker/hadoop.env"
+      CHECKER_LOG_LEVEL: "${CHECKER_LOG_LEVEL:-INFO}"
+    volumes:
+      - ./conf/:/opt/hadoop/etc/hadoop/:ro
+      - ./hadoop.env:/etc/checker/hadoop.env:ro
+    restart: unless-stopped
+    networks:
+      - hadoop-net
+
+  agent-spark-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: hadoop-config-agent:local
+    container_name: config-agent-spark-client
+    hostname: config-agent-spark-client
+    profiles: ["spark-client"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      HADOOP_CONF_DIR: "/opt/hadoop/etc/hadoop"
+      CHECKER_KAFKA_BOOTSTRAP: "${CHECKER_KAFKA_BOOTSTRAP:-kafka:9092}"
+      CHECKER_TOPIC: "${CHECKER_TOPIC:-hadoop-config-snapshots}"
+      CHECKER_SERVICE_NAME: "spark-client"
+      CHECKER_HEARTBEAT: "${CHECKER_HEARTBEAT:-60}"
+      CHECKER_LOG_LEVEL: "${CHECKER_LOG_LEVEL:-INFO}"
+    volumes:
+      - ./conf/:/opt/hadoop/etc/hadoop/:ro
+    restart: unless-stopped
+    networks:
+      - hadoop-net
+
+  # =======================================================================
+  # Hive agents — config from JVM flags, no XML mount.
+  # CHECKER_JVM_FLAGS values mirror the SERVICE_OPTS in docker-compose.yml.
+  # Keep these in sync if the Hive SERVICE_OPTS change.
+  # =======================================================================
+
+  agent-hive-server2:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: hadoop-config-agent:local
+    container_name: config-agent-hive-server2
+    hostname: config-agent-hive-server2
+    profiles: ["hive-server2"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      HADOOP_CONF_DIR: "/nonexistent"
+      CHECKER_KAFKA_BOOTSTRAP: "${CHECKER_KAFKA_BOOTSTRAP:-kafka:9092}"
+      CHECKER_TOPIC: "${CHECKER_TOPIC:-hadoop-config-snapshots}"
+      CHECKER_SERVICE_NAME: "hive-server2"
+      CHECKER_HEARTBEAT: "${CHECKER_HEARTBEAT:-60}"
+      CHECKER_JVM_FLAGS: >-
+        -Dhive.metastore.uris=thrift://hive-metastore:9083
+        -Dhive.server2.thrift.port=10000
+        -Dhive.server2.thrift.bind.host=0.0.0.0
+        -Dhive.server2.authentication=NONE
+        -Dhive.server2.enable.doAs=false
+        -Dfs.defaultFS=hdfs://namenode:8020
+      CHECKER_JVM_FLAGS_NAME: "SERVICE_OPTS"
+      CHECKER_LOG_LEVEL: "${CHECKER_LOG_LEVEL:-INFO}"
+    restart: unless-stopped
+    networks:
+      - hadoop-net
+
+  agent-hive-metastore:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: hadoop-config-agent:local
+    container_name: config-agent-hive-metastore
+    hostname: config-agent-hive-metastore
+    profiles: ["hive-metastore"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      HADOOP_CONF_DIR: "/nonexistent"
+      CHECKER_KAFKA_BOOTSTRAP: "${CHECKER_KAFKA_BOOTSTRAP:-kafka:9092}"
+      CHECKER_TOPIC: "${CHECKER_TOPIC:-hadoop-config-snapshots}"
+      CHECKER_SERVICE_NAME: "hive-metastore"
+      CHECKER_HEARTBEAT: "${CHECKER_HEARTBEAT:-60}"
+      CHECKER_JVM_FLAGS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres-metastore:5432/metastore
+        -Djavax.jdo.option.ConnectionUserName=hive
+        -Djavax.jdo.option.ConnectionPassword=hive
+        -Dhive.metastore.warehouse.dir=hdfs://namenode:8020/user/hive/warehouse
+        -Dhive.metastore.uris=thrift://hive-metastore:9083
+        -Dfs.defaultFS=hdfs://namenode:8020
+      CHECKER_JVM_FLAGS_NAME: "SERVICE_OPTS"
+      CHECKER_LOG_LEVEL: "${CHECKER_LOG_LEVEL:-INFO}"
+    restart: unless-stopped
+    networks:
+      - hadoop-net
+
+  # =======================================================================
+  # Kafka and ZooKeeper agents — config replicated as JVM flags because
+  # both images generate their server config from environment variables
+  # at startup; there is no static host-mountable file. Keep these in
+  # sync if the matching docker-compose.yml service env changes.
+  # =======================================================================
+
+  agent-kafka:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: hadoop-config-agent:local
+    container_name: config-agent-kafka
+    hostname: config-agent-kafka
+    profiles: ["kafka"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      HADOOP_CONF_DIR: "/nonexistent"
+      CHECKER_KAFKA_BOOTSTRAP: "${CHECKER_KAFKA_BOOTSTRAP:-kafka:9092}"
+      CHECKER_TOPIC: "${CHECKER_TOPIC:-hadoop-config-snapshots}"
+      CHECKER_SERVICE_NAME: "kafka"
+      CHECKER_HEARTBEAT: "${CHECKER_HEARTBEAT:-60}"
+      CHECKER_JVM_FLAGS: >-
+        -Dnode.id=1
+        -Dprocess.roles=controller,broker
+        -Dlisteners=PLAINTEXT://:9092,CONTROLLER://:9093
+        -Dadvertised.listeners=PLAINTEXT://kafka:9092
+        -Dcontroller.listener.names=CONTROLLER
+        -Dcontroller.quorum.voters=1@kafka:9093
+        -Dinter.broker.listener.name=PLAINTEXT
+        -Dzookeeper.connect=zookeeper:2181
+      CHECKER_JVM_FLAGS_NAME: "broker.config"
+      CHECKER_LOG_LEVEL: "${CHECKER_LOG_LEVEL:-INFO}"
+    restart: unless-stopped
+    networks:
+      - hadoop-net
+
+  agent-zookeeper:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: hadoop-config-agent:local
+    container_name: config-agent-zookeeper
+    hostname: config-agent-zookeeper
+    profiles: ["zookeeper"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      HADOOP_CONF_DIR: "/nonexistent"
+      CHECKER_KAFKA_BOOTSTRAP: "${CHECKER_KAFKA_BOOTSTRAP:-kafka:9092}"
+      CHECKER_TOPIC: "${CHECKER_TOPIC:-hadoop-config-snapshots}"
+      CHECKER_SERVICE_NAME: "zookeeper"
+      CHECKER_HEARTBEAT: "${CHECKER_HEARTBEAT:-60}"
+      CHECKER_JVM_FLAGS: >-
+        -DclientPort=2181
+        -Dservers=server.1=zookeeper:2888:3888;2181
+      CHECKER_JVM_FLAGS_NAME: "zoo.cfg"
+      CHECKER_LOG_LEVEL: "${CHECKER_LOG_LEVEL:-INFO}"
+    restart: unless-stopped
+    networks:
+      - hadoop-net

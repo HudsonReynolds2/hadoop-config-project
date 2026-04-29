@@ -12,8 +12,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-# Docker override files
-docker-compose.override.yml
+
 # Environment secrets (keep hadoop.env as it has no secrets, but ignore any local overrides)
 *.env.local
 .env
