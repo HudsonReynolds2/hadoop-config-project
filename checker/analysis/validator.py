@@ -84,6 +84,7 @@ from checker.models import (
     DriftResult,
     SOURCE_ENV_FILE,
     SOURCE_JVM_FLAGS,
+    SOURCE_SPARK_CONF,
     SOURCE_XML_FILE,
 )
 
@@ -162,12 +163,18 @@ def load_rules(path: str | Path) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-# Default source preference order: XML wins over env-file wins over
-# jvm-flags. XML is the authoritative *-site.xml on disk; env-file is
+# Default source preference order: XML wins over spark-conf wins over
+# env-file wins over jvm-flags. XML is the authoritative *-site.xml on
+# disk; spark-conf is the authoritative spark-defaults.conf; env-file is
 # typically a docker entrypoint convenience; jvm-flags are last because
 # they may or may not be passed through to the running process depending
 # on the service.
-_DEFAULT_SOURCE_ORDER = (SOURCE_XML_FILE, SOURCE_ENV_FILE, SOURCE_JVM_FLAGS)
+_DEFAULT_SOURCE_ORDER = (
+    SOURCE_XML_FILE,
+    SOURCE_SPARK_CONF,
+    SOURCE_ENV_FILE,
+    SOURCE_JVM_FLAGS,
+)
 
 
 def _find_key(
@@ -823,12 +830,168 @@ def _eval_dual_source(rule: dict, store) -> ValidationResult:
 
 
 # ---------------------------------------------------------------------------
+# must_reference — host:port authority check
+# ---------------------------------------------------------------------------
+
+
+def _split_authority(authority: str) -> tuple[str, str | None]:
+    """Split a ``host:port`` token into ``(host, port)``.
+
+    Returns ``(host, None)`` if no port is present. Whitespace is stripped.
+    Used by ``_eval_must_reference`` to compare individual entries from a
+    comma-separated host list.
+    """
+    s = authority.strip()
+    if not s:
+        return ("", None)
+    # Bracketed IPv6: [::1]:2181
+    if s.startswith("["):
+        end = s.find("]")
+        if end > 0:
+            host = s[1:end]
+            tail = s[end + 1 :]
+            if tail.startswith(":"):
+                return (host, tail[1:].strip())
+            return (host, None)
+    # Plain host[:port]
+    if ":" in s:
+        host, _, port = s.rpartition(":")
+        return (host.strip(), port.strip())
+    return (s, None)
+
+
+def _eval_must_reference(rule: dict, store) -> ValidationResult:
+    """A connection-string key must reference a target service's host:port.
+
+    Rule shape::
+
+        - id: kafka-zookeeper-connect
+          type: must_reference
+          key: zookeeper.connect          # value like "zookeeper:2181"
+          service: kafka                  # which service publishes `key`
+          target_host: zookeeper          # literal host expected
+          target_port_key: clientPort     # port lives in this key
+          target_port_service: zookeeper  # ...on this service
+          severity: critical
+
+    Pass condition: at least one comma-separated entry in ``key`` value
+    has its host equal to ``target_host`` AND its port equal to
+    ``target_port_key``'s value (looked up on ``target_port_service``).
+
+    Skip if any of the three values cannot be resolved — same convention
+    as the other evaluators.
+
+    Why a list? Production ``zookeeper.connect`` strings are
+    comma-separated ZK ensembles like ``zk1:2181,zk2:2181,zk3:2181``. As
+    long as one entry matches the configured target we accept the rule.
+    """
+    rule_id = rule["id"]
+    key = rule["key"]
+    service = rule.get("service")
+    severity = rule.get("severity", "warning")
+    target_host = rule.get("target_host")
+    target_port_key = rule.get("target_port_key")
+    target_port_service = rule.get("target_port_service")
+
+    if not target_host or not target_port_key:
+        return ValidationResult(
+            rule_id=rule_id,
+            description=rule.get("description", ""),
+            passed=True,
+            severity=severity,
+            details=(
+                f"must_reference rule missing target_host or target_port_key, "
+                "skipped"
+            ),
+            status=STATUS_SKIP,
+        )
+
+    # Source value (e.g. zookeeper.connect on kafka).
+    val = _find_key(store, key, preferred_service=service)
+    if val is None:
+        return ValidationResult(
+            rule_id=rule_id,
+            description=rule.get("description", ""),
+            passed=True,
+            severity=severity,
+            details=f"key {key!r} (service={service}) not found, rule skipped",
+            status=STATUS_SKIP,
+        )
+
+    # Target port value (e.g. clientPort on zookeeper).
+    target_port_val = _find_key(
+        store, target_port_key, preferred_service=target_port_service
+    )
+    if target_port_val is None:
+        return ValidationResult(
+            rule_id=rule_id,
+            description=rule.get("description", ""),
+            passed=True,
+            severity=severity,
+            details=(
+                f"target port key {target_port_key!r} "
+                f"(service={target_port_service}) not found, rule skipped"
+            ),
+            status=STATUS_SKIP,
+        )
+    expected_port = target_port_val.strip()
+
+    # Walk every comma-separated entry; any match is enough.
+    entries = [e for e in val.split(",") if e.strip()]
+    matched_entry = None
+    for entry in entries:
+        host, port = _split_authority(entry)
+        if host == target_host and port is not None and port == expected_port:
+            matched_entry = entry.strip()
+            break
+
+    if matched_entry is not None:
+        details = (
+            f"{key}={val!r} references {target_host}:{expected_port} "
+            f"(matched entry: {matched_entry!r}): OK"
+        )
+        return ValidationResult(
+            rule_id=rule_id,
+            description=rule.get("description", ""),
+            passed=True,
+            severity=severity,
+            details=details,
+            status=STATUS_PASS,
+        )
+
+    details = (
+        f"{key}={val!r} does NOT reference {target_host}:{expected_port} "
+        f"(expected from {target_port_service}:{target_port_key})"
+    )
+    drift = DriftResult(
+        key=key,
+        service=service or "unknown",
+        source_a=f"service:{service}:{key}",
+        value_a=val,
+        source_b=f"expected:{target_host}:{expected_port}",
+        value_b=f"{target_host}:{expected_port}",
+        severity=severity,
+        rule_id=rule_id,
+    )
+    return ValidationResult(
+        rule_id=rule_id,
+        description=rule.get("description", ""),
+        passed=False,
+        severity=severity,
+        details=details,
+        drift=drift,
+        status=STATUS_FAIL,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Top-level evaluator
 # ---------------------------------------------------------------------------
 
 _EVALUATORS = {
     "constraint": _eval_constraint,
     "propagation": _eval_propagation,
+    "must_reference": _eval_must_reference,
 }
 
 

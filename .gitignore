@@ -31,3 +31,6 @@ Thumbs.db
 .venv/
 venv/*
 venv
+
+tests/results
+tests/results/*

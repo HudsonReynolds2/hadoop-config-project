@@ -20,7 +20,7 @@
     <value>hive</value>
   </property>
 
-  <!-- Warehouse lives on HDFS — MUTATED: wrong namenode host -->
+  <!-- Warehouse lives on HDFS -->
   <property>
     <n>hive.metastore.warehouse.dir</n>
     <value>hdfs://namenode:8020/user/hive/warehouse</value>
@@ -32,6 +32,7 @@
     <value>thrift://hive-metastore:9083</value>
   </property>
 
+  <!-- Don't try to auto-create schema at runtime; we use schematool in the init service -->
   <property>
     <n>datanucleus.schema.autoCreateAll</n>
     <value>false</value>
@@ -41,6 +42,7 @@
     <value>true</value>
   </property>
 
+  <!-- HS2 binding -->
   <property>
     <n>hive.server2.thrift.port</n>
     <value>10000</value>
@@ -58,6 +60,7 @@
     <value>10002</value>
   </property>
 
+  <!-- Auth: NONE for dev cluster -->
   <property>
     <n>hive.server2.authentication</n>
     <value>NONE</value>
@@ -67,6 +70,7 @@
     <value>false</value>
   </property>
 
+  <!-- Tell Hive the default fs explicitly (some Hive internals check here before core-site) -->
   <property>
     <n>fs.defaultFS</n>
     <value>hdfs://namenode:8020</value>

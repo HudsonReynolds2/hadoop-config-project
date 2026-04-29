@@ -1,24 +1,19 @@
-# Consumer / checker service for hadoop-config-checker.
-#
-# Consumes ConfigSnapshot messages from Kafka, runs drift detection, and
-# emits structured JSON reports to stdout (and optionally to an alerts topic).
-#
-# Build:
-#   docker build -f Dockerfile.checker -t hadoop-config-checker:local .
-
 FROM python:3.12-slim
-
 LABEL maintainer="hadoop-config-checker"
 LABEL description="Config drift consumer — detects drift, emits reports"
 
+# Install dependencies
 RUN pip install --no-cache-dir \
     kafka-python \
     click \
     pyyaml
 
+# Copy and install the package so the `hadoopconf` console script is created
+COPY pyproject.toml /app/pyproject.toml
 COPY checker/ /app/checker/
 
 WORKDIR /app
+RUN pip install --no-cache-dir -e .
 
 ENV CHECKER_KAFKA_BOOTSTRAP=kafka:9092 \
     CHECKER_TOPIC=hadoop-config-snapshots \

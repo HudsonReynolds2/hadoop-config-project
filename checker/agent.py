@@ -28,6 +28,12 @@ CHECKER_JVM_FLAGS_NAME
     Human-readable tag for the JVM flags source (e.g. ``"SERVICE_OPTS"``).
     Default: ``"jvm_flags"``
 
+CHECKER_SPARK_DEFAULTS_FILE
+    Optional path to a ``spark-defaults.conf``-style file. When set, the
+    agent parses whitespace-separated ``KEY VALUE`` pairs and publishes a
+    snapshot with ``source="spark_conf"``. Used by the spark-client
+    sidecar; unset for everyone else.
+
 CHECKER_KAFKA_BOOTSTRAP
     Kafka bootstrap server.  Default: ``kafka:9092``
 
@@ -216,12 +222,28 @@ def _collect_jvm_snapshot(
     return None
 
 
+def _collect_spark_snapshot(spark_conf_path: str, service: str):
+    """Collect a ConfigSnapshot from a spark-defaults.conf file, or None."""
+    from checker.collectors.spark_collector import parse_spark_conf, SparkCollectorError
+
+    try:
+        snap = parse_spark_conf(spark_conf_path, service=service)
+        logger.debug(
+            "collected spark conf %s (%d keys)", spark_conf_path, len(snap.properties)
+        )
+        return snap
+    except SparkCollectorError as exc:
+        logger.error("failed to collect spark conf %s: %s", spark_conf_path, exc)
+        return None
+
+
 def collect_all(
     conf_dir: str,
     service: str,
     env_path: str | None = None,
     jvm_flags: str | None = None,
     jvm_flags_name: str = "jvm_flags",
+    spark_conf_path: str | None = None,
 ) -> list:
     """Collect snapshots from all configured sources.
 
@@ -236,6 +258,10 @@ def collect_all(
             snapshots.append(snap)
     if jvm_flags:
         snap = _collect_jvm_snapshot(jvm_flags, service, jvm_flags_name)
+        if snap:
+            snapshots.append(snap)
+    if spark_conf_path:
+        snap = _collect_spark_snapshot(spark_conf_path, service)
         if snap:
             snapshots.append(snap)
     return snapshots
@@ -301,6 +327,7 @@ def _start_watcher(
     env_path: str | None,
     jvm_flags: str | None,
     jvm_flags_name: str,
+    spark_conf_path: str | None,
 ) -> object | None:
     """Start a watchdog observer on ``conf_dir``.
 
@@ -318,8 +345,22 @@ def _start_watcher(
         logger.warning("watchdog not installed — file watching disabled")
         return None
 
+    # If spark_conf is in the same directory we're already watching, fold
+    # its filename into the trigger set so a write to it also triggers a
+    # full re-collection. Otherwise treat it as a separate watched file
+    # below.
+    spark_basename = None
+    spark_in_conf_dir = False
+    if spark_conf_path:
+        sp = Path(spark_conf_path)
+        spark_basename = sp.name
+        try:
+            spark_in_conf_dir = sp.parent.resolve() == Path(conf_dir).resolve()
+        except OSError:
+            spark_in_conf_dir = False
+
     class _Handler(FileSystemEventHandler):
-        """Re-collect and publish on any *-site.xml change."""
+        """Re-collect and publish on any *-site.xml or spark-defaults change."""
 
         def __init__(self):
             super().__init__()
@@ -332,7 +373,11 @@ def _start_watcher(
             if event.is_directory:
                 return
             path = Path(event.src_path)
-            if not path.name.endswith("-site.xml"):
+            is_xml = path.name.endswith("-site.xml")
+            is_spark = (
+                spark_basename is not None and path.name == spark_basename
+            )
+            if not (is_xml or is_spark):
                 return
 
             with self._lock:
@@ -344,13 +389,26 @@ def _start_watcher(
 
             logger.info("detected change in %s — re-collecting", path.name)
             snapshots = collect_all(
-                conf_dir, service, env_path, jvm_flags, jvm_flags_name
+                conf_dir, service, env_path, jvm_flags, jvm_flags_name,
+                spark_conf_path,
             )
             count = publisher.publish(snapshots)
             logger.info("published %d snapshot(s) after file change", count)
 
     observer = Observer()
     observer.schedule(_Handler(), conf_dir, recursive=False)
+
+    # If spark-defaults lives outside the conf dir, watch its parent dir
+    # too so we catch in-place edits from `cp` or `mv`-style restores.
+    if spark_conf_path and not spark_in_conf_dir:
+        try:
+            spark_parent = str(Path(spark_conf_path).parent)
+            if Path(spark_parent).is_dir():
+                observer.schedule(_Handler(), spark_parent, recursive=False)
+                logger.info("watching %s for spark-defaults changes", spark_parent)
+        except OSError:
+            pass
+
     observer.daemon = True
     observer.start()
     logger.info("watching %s for changes", conf_dir)
@@ -377,6 +435,7 @@ def run_agent() -> None:
     env_path = os.environ.get("CHECKER_ENV_FILE")
     jvm_flags = os.environ.get("CHECKER_JVM_FLAGS")
     jvm_flags_name = _env("CHECKER_JVM_FLAGS_NAME", "jvm_flags")
+    spark_conf_path = os.environ.get("CHECKER_SPARK_DEFAULTS_FILE")
 
     logging.basicConfig(
         level=getattr(logging, log_level.upper(), logging.INFO),
@@ -388,6 +447,8 @@ def run_agent() -> None:
         "agent starting: service=%s conf_dir=%s kafka=%s topic=%s heartbeat=%ds",
         service, conf_dir, bootstrap, topic, heartbeat,
     )
+    if spark_conf_path:
+        logger.info("spark-defaults file: %s", spark_conf_path)
 
     # Ensure topic exists
     _ensure_topic(bootstrap, topic, partitions, replication)
@@ -396,13 +457,16 @@ def run_agent() -> None:
     publisher = SnapshotPublisher(bootstrap, topic)
 
     # Initial collection + publish
-    snapshots = collect_all(conf_dir, service, env_path, jvm_flags, jvm_flags_name)
+    snapshots = collect_all(
+        conf_dir, service, env_path, jvm_flags, jvm_flags_name, spark_conf_path
+    )
     count = publisher.publish(snapshots)
     logger.info("initial publish: %d snapshot(s), %d source(s)", count, len(snapshots))
 
     # Start file watcher
     observer = _start_watcher(
-        conf_dir, service, publisher, env_path, jvm_flags, jvm_flags_name
+        conf_dir, service, publisher, env_path, jvm_flags, jvm_flags_name,
+        spark_conf_path,
     )
 
     # Graceful shutdown
@@ -422,7 +486,8 @@ def run_agent() -> None:
             if shutdown.is_set():
                 break
             snapshots = collect_all(
-                conf_dir, service, env_path, jvm_flags, jvm_flags_name
+                conf_dir, service, env_path, jvm_flags, jvm_flags_name,
+                spark_conf_path,
             )
             count = publisher.publish(snapshots)
             logger.debug("heartbeat: published %d snapshot(s)", count)

@@ -35,6 +35,10 @@ class EdgeType(Enum):
 SOURCE_XML_FILE = "xml_file"
 SOURCE_ENV_FILE = "env_file"
 SOURCE_JVM_FLAGS = "jvm_flags"
+# Stage 3: native Spark config source. Distinct from env_file so the
+# source-preference logic in the validator can treat it as authoritative
+# for Spark keys (mirroring how XML is authoritative for hadoop *-site.xml).
+SOURCE_SPARK_CONF = "spark_conf"
 
 
 def _utc_now_iso() -> str:
