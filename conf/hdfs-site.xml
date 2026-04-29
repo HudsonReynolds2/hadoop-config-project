@@ -3,4 +3,5 @@
 <property><name>dfs.datanode.data.dir</name><value>/hadoop/dfs/data</value></property>
 <property><name>dfs.namenode.name.dir</name><value>/hadoop/dfs/name</value></property>
 <property><name>dfs.replication</name><value>1</value></property>
+<property><name>dfs.replication.max</name><value>512</value></property>
 </configuration>
