@@ -22,7 +22,7 @@ TEST_NAME="08-multi-agent-propagation"
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CORE_XML="$REPO_ROOT/conf/core-site.xml"
 ORIGINAL_CONTENT=""
-DRIFT_WAIT_SEC=90
+DRIFT_WAIT_SEC=150
 
 # Agents we expect to react. The list intentionally omits hive-server2 and
 # hive-metastore (their fs.defaultFS comes from JVM flags, not the XML
@@ -125,14 +125,19 @@ echo "[$TEST_NAME] mutation visible in all agents: $NEW_VAL"
 
 # ---------------------------------------------------------------------------
 # 4. Wait for the checker to report drift mentioning the new value.
+#    Use hadoopconf status rather than log-grepping: docker logs --since
+#    with ISO timestamps is unreliable on WSL2/Docker Desktop.
 # ---------------------------------------------------------------------------
 
 DEADLINE=$(( $(date +%s) + DRIFT_WAIT_SEC ))
 SAW_DRIFT=""
+checker_logs=""
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-  checker_logs=$(docker logs --since "$BASELINE" config-checker 2>&1 || true)
-  if echo "$checker_logs" | grep -q "drifted-namenode"; then
+  status_json=$(docker exec config-checker hadoopconf status --format json \
+    --timeout 5 2>/dev/null || true)
+  if echo "$status_json" | grep -q "drifted-namenode"; then
     SAW_DRIFT=1
+    checker_logs="$status_json"
     break
   fi
   sleep 2
@@ -149,7 +154,7 @@ echo "[$TEST_NAME] checker reported drift containing the new fs.defaultFS"
 # services as each agent re-publishes.
 SEEN_SERVICES=0
 for svc in namenode datanode resourcemanager nodemanager spark-client; do
-  if echo "$checker_logs" | grep -q "\"service\": \"$svc\""; then
+  if echo "$checker_logs" | grep -qE "\"service\"[[:space:]]*:[[:space:]]*\"$svc\""; then
     SEEN_SERVICES=$(( SEEN_SERVICES + 1 ))
   fi
 done

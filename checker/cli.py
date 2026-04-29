@@ -1,13 +1,4 @@
-"""CLI entry point for hadoop-config-checker.
-
-Usage::
-
-    hadoopconf consume                    # Kafka consumer loop
-    hadoopconf oneshot FILE               # drift detection on snapshot JSON
-    hadoopconf validate CONF_DIR RULES    # validate local configs against rules
-    hadoopconf collect DIR                # collect and print snapshots
-    hadoopconf status                     # query live cluster state via Kafka
-"""
+"""CLI entry point for hadoop-config-checker."""
 
 from __future__ import annotations
 
@@ -41,15 +32,11 @@ def main():
     @cli.command()
     @click.argument("snapshot_file", type=click.Path(exists=True))
     @click.option("--rules", "rules_file", default=None,
-                  type=click.Path(exists=True),
-                  help="YAML rule file to validate against.")
+                  type=click.Path(exists=True))
     @click.option("--format", "fmt", type=click.Choice(["json", "text"]),
-                  default="text", help="Output format.")
-    def oneshot(snapshot_file: str, rules_file: str | None, fmt: str):
-        """Run one-shot drift detection on a snapshot JSON file.
-
-        Exits 1 if drift found, 0 otherwise (CI/CD gate).
-        """
+                  default="text")
+    def oneshot(snapshot_file, rules_file, fmt):
+        """Run one-shot drift detection on a snapshot JSON file."""
         from checker.analysis.causality_graph import CausalityGraph
         from checker.consumer import run_oneshot
 
@@ -74,51 +61,32 @@ def main():
         else:
             click.echo(f"Found {len(results)} drift(s):\n")
             for r in results:
-                sev = r.severity.upper()
                 rule = f" [{r.rule_id}]" if r.rule_id else ""
-                click.echo(f"  [{sev}]{rule} {r.key}")
+                click.echo(f"  [{r.severity.upper()}]{rule} {r.key}")
                 click.echo(f"    {r.source_a}: {r.value_a}")
-                click.echo(f"    {r.source_b}: {r.value_b}")
-                click.echo()
-            if root_causes:
-                click.echo(f"Root causes ({len(root_causes)}):\n")
-                for rc in root_causes:
-                    click.echo(f"  [{rc.severity.upper()}] {rc.key} ({rc.service})")
-                    if rc.downstream_effects:
-                        for eff in rc.downstream_effects:
-                            click.echo(f"    → {eff}")
-                    else:
-                        click.echo(f"    (no downstream effects in graph)")
-                    click.echo()
-
+                click.echo(f"    {r.source_b}: {r.value_b}\n")
         sys.exit(1)
 
     @cli.command()
     @click.argument("conf_dir", type=click.Path(exists=True))
     @click.argument("rules_file", type=click.Path(exists=True))
-    @click.option("--service", default="unknown", help="Service name tag.")
-    @click.option("--env-file", default=None, help="Path to hadoop.env file.")
-    @click.option("--jvm-flags", default=None, help="JVM flags string.")
-    @click.option("--jvm-flags-name", default="jvm_flags", help="JVM flags source name.")
+    @click.option("--service", default="unknown")
+    @click.option("--env-file", default=None)
+    @click.option("--jvm-flags", default=None)
+    @click.option("--jvm-flags-name", default="jvm_flags")
     @click.option("--spark-defaults", "spark_defaults", default=None,
-                  type=click.Path(exists=True),
-                  help="Path to spark-defaults.conf file.")
+                  type=click.Path(exists=True))
     @click.option("--format", "fmt", type=click.Choice(["json", "text"]),
-                  default="text", help="Output format.")
+                  default="text")
     def validate(conf_dir, rules_file, service, env_file, jvm_flags,
                  jvm_flags_name, spark_defaults, fmt):
-        """Validate local config files against a YAML rule set.
-
-        Exits 1 if any rule fails, 0 if all pass.
-        """
+        """Validate local config files against a YAML rule set."""
         from checker.agent import collect_all
         from checker.analysis.validator import load_rules, validate as run_validate
         from checker.consumer import SnapshotStore
 
-        snapshots = collect_all(
-            conf_dir, service, env_file, jvm_flags, jvm_flags_name,
-            spark_defaults,
-        )
+        snapshots = collect_all(conf_dir, service, env_file, jvm_flags,
+                                jvm_flags_name, spark_defaults)
         rules = load_rules(rules_file)
 
         store = SnapshotStore()
@@ -143,32 +111,25 @@ def main():
                     click.echo(f"  [{r.severity.upper()}] {r.rule_id}: {r.details}")
                 click.echo()
             click.echo("All rules passed." if not failed else f"{len(failed)} rule(s) failed.")
-
         sys.exit(1 if any(not r.passed for r in results) else 0)
 
     @cli.command()
     @click.argument("conf_dir", type=click.Path(exists=True))
-    @click.option("--service", default="unknown", help="Service name tag.")
-    @click.option("--env-file", default=None, help="Path to hadoop.env file.")
-    @click.option("--jvm-flags", default=None, help="JVM flags string.")
-    @click.option("--jvm-flags-name", default="jvm_flags", help="JVM flags source name.")
+    @click.option("--service", default="unknown")
+    @click.option("--env-file", default=None)
+    @click.option("--jvm-flags", default=None)
+    @click.option("--jvm-flags-name", default="jvm_flags")
     @click.option("--spark-defaults", "spark_defaults", default=None,
-                  type=click.Path(exists=True),
-                  help="Path to spark-defaults.conf file.")
+                  type=click.Path(exists=True))
     @click.option("--format", "fmt", type=click.Choice(["json", "text"]),
-                  default="text", help="Output format.")
-    @click.option("--detect-drift/--no-detect-drift", default=False,
-                  help="Run cross-source drift detection.")
+                  default="text")
+    @click.option("--detect-drift/--no-detect-drift", default=False)
     def collect(conf_dir, service, env_file, jvm_flags, jvm_flags_name,
                 spark_defaults, fmt, detect_drift):
         """Collect config snapshots from local files and print them."""
         from checker.agent import collect_all
-
-        snapshots = collect_all(
-            conf_dir, service, env_file, jvm_flags, jvm_flags_name,
-            spark_defaults,
-        )
-
+        snapshots = collect_all(conf_dir, service, env_file, jvm_flags,
+                                jvm_flags_name, spark_defaults)
         if fmt == "json":
             click.echo(json.dumps({s.agent_id: s.to_dict() for s in snapshots}, indent=2))
         else:
@@ -185,41 +146,29 @@ def main():
                 for d in drifts:
                     click.echo(f"  [{d.severity.upper()}] {d.key}")
                     click.echo(f"    {d.source_a}: {d.value_a}")
-                    click.echo(f"    {d.source_b}: {d.value_b}")
-                    click.echo()
+                    click.echo(f"    {d.source_b}: {d.value_b}\n")
             else:
                 click.echo("\nNo cross-source drift detected.")
 
+    # -----------------------------------------------------------------
+    # status — the command that was hanging.
+    # New strategy: read ONLY the latest message per partition by
+    # seeking each partition to (end-offset - N) where N is just enough
+    # to cover one heartbeat window's worth of messages. Bound the read
+    # by a wall-clock deadline that ALWAYS fires.
+    # -----------------------------------------------------------------
     @cli.command()
-    @click.option("--bootstrap", default=None,
-                  help="Kafka bootstrap (overrides CHECKER_KAFKA_BOOTSTRAP).")
-    @click.option("--topic", default=None,
-                  help="Snapshot topic (overrides CHECKER_TOPIC).")
+    @click.option("--bootstrap", default=None)
+    @click.option("--topic", default=None)
     @click.option("--rules", "rules_file", default=None,
-                  type=click.Path(exists=True),
-                  help="YAML rule file to validate against. Falls back to "
-                       "CHECKER_RULES_FILE if unset.")
+                  type=click.Path(exists=True))
     @click.option("--graph-file", "graph_file", default=None,
-                  type=click.Path(exists=True),
-                  help="YAML causality-graph file. Falls back to "
-                       "CHECKER_GRAPH_FILE if unset.")
-    @click.option("--timeout", "timeout", default=10, type=int,
-                  help="Seconds to wait for a complete snapshot poll.")
+                  type=click.Path(exists=True))
+    @click.option("--timeout", "timeout", default=10, type=int)
     @click.option("--format", "fmt", type=click.Choice(["json", "text"]),
-                  default="text", help="Output format.")
+                  default="text")
     def status(bootstrap, topic, rules_file, graph_file, timeout, fmt):
-        """Query live cluster state by replaying current snapshots from Kafka.
-
-        Reads every snapshot currently on the topic into a fresh in-memory
-        store, runs the full validator + causality pipeline against it,
-        and prints the result. Exits 1 if any rule fails or any drift is
-        present; exits 0 if the cluster is clean.
-
-        Unlike ``validate``, which checks one local conf dir, ``status``
-        sees what every running agent is actually publishing — so it
-        catches multi-service propagation issues that a single conf
-        directory cannot reveal.
-        """
+        """Query live cluster state by replaying recent snapshots from Kafka."""
         import os
         import time
 
@@ -236,62 +185,105 @@ def main():
         try:
             from kafka import KafkaConsumer, TopicPartition
         except ImportError:
-            click.echo("kafka-python is required. pip install kafka-python", err=True)
+            click.echo("kafka-python is required.", err=True)
             sys.exit(2)
 
-        # Each `status` invocation is a fresh, anonymous group.
-        # Rather than replaying the entire topic from the beginning (which
-        # accumulates thousands of messages over a long-running cluster),
-        # we seek to messages published within the last 2x heartbeat window.
-        # Every agent republishes its full snapshot on every heartbeat, so
-        # one heartbeat window is always enough to see every agent's current
-        # state regardless of how long the cluster has been running.
-        group_id = f"hadoopconf-status-{int(time.time() * 1000)}"
-        heartbeat_ms = int(os.environ.get("CHECKER_HEARTBEAT", "60")) * 1000
-        lookback_ms = heartbeat_ms * 2
-        since_ms = int(time.time() * 1000) - lookback_ms
+        # Hard wall-clock deadline. Nothing past this point waits for Kafka
+        # longer than `timeout` seconds total.
+        deadline = time.time() + timeout
 
-        consumer = KafkaConsumer(
-            bootstrap_servers=bootstrap,
-            group_id=group_id,
-            value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-            enable_auto_commit=False,
-            consumer_timeout_ms=int(timeout * 1000),
-        )
+        # Read at most this many messages per partition. With 12 partitions
+        # this caps memory + time; comfortably more than the number of
+        # active agents (~10).
+        MAX_MSGS_PER_PARTITION = 50
 
-        # Assign partitions manually so we can seek before consuming.
-        partitions = consumer.partitions_for_topic(topic) or {0}
+        try:
+            consumer = KafkaConsumer(
+                bootstrap_servers=bootstrap,
+                value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+                enable_auto_commit=False,
+                consumer_timeout_ms=2000,
+                request_timeout_ms=5000,
+                api_version_auto_timeout_ms=5000,
+            )
+        except Exception as e:
+            click.echo(f"(kafka connect failed: {e})", err=True)
+            sys.exit(2)
+
+        # --- partition discovery (bounded) ---
+        partitions = None
+        while time.time() < deadline:
+            try:
+                partitions = consumer.partitions_for_topic(topic)
+                if partitions:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.3)
+
+        if not partitions:
+            try: consumer.close()
+            except Exception: pass
+            click.echo(f"(no metadata for topic {topic!r})", err=True)
+            sys.exit(2)
+
         tp_list = [TopicPartition(topic, p) for p in partitions]
         consumer.assign(tp_list)
 
-        # Seek each partition to the first offset at or after since_ms.
-        # If no messages exist that recent, seek to end (empty result).
-        offsets = consumer.offsets_for_times({tp: since_ms for tp in tp_list})
-        for tp, offset_and_ts in offsets.items():
-            if offset_and_ts is not None:
-                consumer.seek(tp, offset_and_ts.offset)
-            else:
-                consumer.seek_to_end(tp)
+        # --- seek each partition to (end - MAX_MSGS_PER_PARTITION) ---
+        # This is the key change: we read only the tail of each partition,
+        # not from since_ms (which on a long-running cluster covers
+        # thousands of messages and was the source of the hang).
+        try:
+            end_offsets = consumer.end_offsets(tp_list)
+            beg_offsets = consumer.beginning_offsets(tp_list)
+            for tp in tp_list:
+                end = end_offsets.get(tp, 0)
+                beg = beg_offsets.get(tp, 0)
+                target = max(beg, end - MAX_MSGS_PER_PARTITION)
+                consumer.seek(tp, target)
+        except Exception as e:
+            click.echo(f"(seek failed: {e})", err=True)
+            try: consumer.close()
+            except Exception: pass
+            sys.exit(2)
+
+        # Total messages we expect to read across all partitions.
+        total_expected = 0
+        try:
+            for tp in tp_list:
+                end = end_offsets.get(tp, 0)
+                beg = beg_offsets.get(tp, 0)
+                target = max(beg, end - MAX_MSGS_PER_PARTITION)
+                total_expected += max(0, end - target)
+        except Exception:
+            total_expected = MAX_MSGS_PER_PARTITION * len(tp_list)
 
         store = SnapshotStore()
         snap_count = 0
         try:
             for message in consumer:
+                if time.time() > deadline:
+                    break
                 try:
                     snap = ConfigSnapshot.from_dict(message.value)
                 except (TypeError, KeyError):
                     continue
                 store.put(snap)
                 snap_count += 1
+                if snap_count >= total_expected:
+                    break
+        except Exception:
+            pass
         finally:
-            consumer.close()
+            try: consumer.close(autocommit=False)
+            except Exception: pass
 
         rules = []
         if rules_file:
             from checker.analysis.validator import load_rules
             rules = load_rules(rules_file)
 
-        # Causality graph: env var or --graph-file overrides the default.
         if graph_file:
             os.environ["CHECKER_GRAPH_FILE"] = graph_file
         graph = CausalityGraph.load_default()
@@ -299,23 +291,19 @@ def main():
         validation_results = run_validate(rules, store) if rules else []
         cross_source_drifts = detect_cross_source(store.all_snapshots())
 
-        # Aggregate everything that points at a real drift, then trace.
         all_drifts = list(cross_source_drifts)
         for vr in validation_results:
             if not vr.passed and vr.drift is not None:
                 all_drifts.append(vr.drift)
         root_causes = graph.trace(all_drifts) if all_drifts else []
 
-        # Summary numbers.
         services = sorted(store.services())
         agents = sorted(s.agent_id for s in store.all_snapshots())
-        passed_rules = [r for r in validation_results if r.passed]
+        passed_rules = [r for r in validation_results if r.passed and getattr(r, "status", "pass") != "skip"]
         failed_rules = [r for r in validation_results if not r.passed]
-        skipped_rules = [
-            r for r in validation_results if getattr(r, "status", "pass") == "skip"
-        ]
+        skipped_rules = [r for r in validation_results if getattr(r, "status", "pass") == "skip"]
 
-        is_clean = not failed_rules and not cross_source_drifts and snap_count > 0
+        is_clean = not failed_rules and not cross_source_drifts and len(store) > 0
 
         if fmt == "json":
             out = {
@@ -337,14 +325,15 @@ def main():
             click.echo(f"Agents: {len(agents)} ({', '.join(agents) or '-'})")
             click.echo(f"Services: {len(services)} ({', '.join(services) or '-'})")
             click.echo()
-            click.echo(
-                f"Rules: {len(passed_rules)} passed, {len(failed_rules)} failed, "
-                f"{len(skipped_rules)} skipped"
-            )
+            click.echo(f"Rules: {len(passed_rules)} passed, {len(failed_rules)} failed, {len(skipped_rules)} skipped")
             if failed_rules:
                 click.echo()
                 for r in failed_rules:
                     click.echo(f"  [{r.severity.upper()}] {r.rule_id}: {r.details}")
+            if skipped_rules:
+                click.echo()
+                for r in skipped_rules:
+                    click.echo(f"  [SKIP] {r.rule_id}: {r.details}")
             if cross_source_drifts:
                 click.echo()
                 click.echo(f"Cross-source drift: {len(cross_source_drifts)}")
@@ -362,9 +351,7 @@ def main():
             click.echo()
             click.echo("CLEAN." if is_clean else "DRIFT DETECTED.")
 
-        if snap_count == 0:
-            # No snapshots received at all — neither clean nor drifted,
-            # but a developer needs to know. Distinct exit code.
+        if len(store) == 0:
             click.echo("(no snapshots received within timeout)", err=True)
             sys.exit(2)
         sys.exit(0 if is_clean else 1)
@@ -374,4 +361,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

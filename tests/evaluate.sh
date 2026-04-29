@@ -177,9 +177,19 @@ restore_conf() {
   if [ -n "$SNAPSHOT_BACKUP" ] && [ -d "$SNAPSHOT_BACKUP" ]; then
     for f in "$SNAPSHOT_BACKUP/conf"/*; do
       [ -f "$f" ] || continue
-      cp -a "$f" "$CONF_DIR/$(basename "$f")"
+      # In-place write: preserves inode so Docker Desktop WSL2 bind mounts
+      # don't break. cp -a would replace the inode and lose the mount.
+      printf '%s' "$(cat "$f")" > "$CONF_DIR/$(basename "$f")"
     done
-    [ -f "$SNAPSHOT_BACKUP/root/hadoop.env" ] &&       cp -a "$SNAPSHOT_BACKUP/root/hadoop.env" "$REPO_ROOT/hadoop.env"
+    [ -f "$SNAPSHOT_BACKUP/root/hadoop.env" ] && \
+      printf '%s' "$(cat "$SNAPSHOT_BACKUP/root/hadoop.env")" > "$REPO_ROOT/hadoop.env"
+    # Force-recreate namenode and datanode so their single-file bind mounts
+    # are re-established. WSL2/Docker Desktop loses the mount after inode
+    # changes even with in-place writes on some kernel versions.
+    docker compose up -d --force-recreate --no-deps namenode datanode \
+      >/dev/null 2>&1 || true
+    docker compose up -d --no-deps spark-client hive-server2 \
+      >/dev/null 2>&1 || true
   fi
 }
 
@@ -322,9 +332,11 @@ run_scenario() {
       metadata.env|README.md) continue ;;
     esac
     if [ "$base" = "hadoop.env" ]; then
-      cp -a "$f" "$REPO_ROOT/hadoop.env"
+      # In-place write: preserves inode so Docker Desktop WSL2 bind mounts
+      # don't break. cp -a would replace the inode and lose the mount.
+      printf '%s' "$(cat "$f")" > "$REPO_ROOT/hadoop.env"
     else
-      cp -a "$f" "$CONF_DIR/$base"
+      printf '%s' "$(cat "$f")" > "$CONF_DIR/$base"
     fi
   done
 

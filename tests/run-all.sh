@@ -26,6 +26,13 @@ echo "================================================================"
 echo " hadoop-stack functionality tests"
 echo "================================================================"
 
+echo "Waiting for namenode to exit safe mode..."
+until docker exec namenode hdfs dfsadmin -safemode get 2>/dev/null | grep -q "Safe mode is OFF"; do
+  sleep 3
+done
+echo "Namenode ready."
+echo
+
 for t in "${TESTS[@]}"; do
   echo
   echo "---- running $t ----"
